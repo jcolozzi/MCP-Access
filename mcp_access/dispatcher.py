@@ -629,6 +629,20 @@ def call_tool_sync(name: str, arguments: dict) -> str:
             )
             text = json.dumps(result, ensure_ascii=False, indent=2)
 
+        elif name == "access_graph":
+            from .graph import ac_graph
+            result = ac_graph(
+                arguments["db_path"],
+                out_dir=arguments.get("out_dir"),
+                field_mode=arguments.get("field_mode", "referenced"),
+                include_code_heuristics=bool(
+                    arguments.get("include_code_heuristics", True)),
+                include_macro_heuristics=bool(
+                    arguments.get("include_macro_heuristics", True)),
+                embed_viewer=bool(arguments.get("embed_viewer", True)),
+            )
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+
         else:
             text = f"ERROR: unknown tool '{name}'"
 

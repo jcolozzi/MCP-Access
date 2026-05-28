@@ -11,7 +11,7 @@ MCP server for reading and editing Microsoft Access databases (`.accdb`/`.mdb`) 
 - **Caches**: `_parsed_controls_cache` (control parsing) and `_Session._cm_cache` (CodeModule COM objects — live COM proxies). Both invalidated on DB switch, object modification, and design operations. There is **no** Python-side cache of VBE text: `_cm_all_code()` always reads via `cm.Lines(1, total)` so external edits (manual VBE edits, Ctrl+Z, add-ins) are picked up immediately. See issue #26 for the reason this cache was removed.
 - **Binary section handling**: `ac_get_code` strips PrtMip/PrtDevMode from form/report exports; `ac_set_code` restores them automatically before import.
 
-## Tools (65 total)
+## Tools (66 total)
 
 | Category | Tools |
 |----------|-------|
@@ -28,6 +28,7 @@ MCP server for reading and editing Microsoft Access databases (`.accdb`/`.mdb`) 
 | **Maintenance** | `access_compact_repair`, `access_decompile_compact` |
 | **Screenshot & UI** | `access_screenshot`, `access_ui_click`, `access_ui_type` |
 | **Queries** | `access_manage_query` |
+| **Graph** | `access_graph` |
 | **Indexes** | `access_list_indexes`, `access_manage_index` |
 | **VBA Compilation** | `access_compile_vba` |
 | **VBA Execution** | `access_run_macro`, `access_run_vba`, `access_eval_vba` |
@@ -122,6 +123,55 @@ Macros have always been fully supported via the regular code tools — no dedica
 
 `access_manage_tab_order` uses **single-pass assignment** in target order — Access enforces TabIndex to be in `0..(N-1)` per section and auto-renumbers the rest to preserve uniqueness when you set one. Do NOT try to "park" controls at indices >= N (Access rejects with "The value you used for the TabIndex property isn't valid. The correct values are from 0 through N-1."). Skips non-tabbable types (100=Label, 101=Rectangle, 102=Line, 103=Image, 114=PageBreak, 118=Page). Optional `section` filter; defaults to all sections.
 
+## Database dependency graph (v0.7.37)
+
+`access_graph` builds a vis.js-compatible dependency graph of the entire Access database. Implementation: `mcp_access/graph.py` (~1000 lines), viewer template: `mcp_access/viewer.html`.
+
+### Architecture
+
+- **`GraphBuilder` class**: accumulates nodes (dict keyed by ID) and edges (list). Deduplicates edges via `_edge_dedup` set of `(from, to, kind, label)` tuples. Tracks `_name_targets` (defaultdict mapping lowercase names to possible node targets) for ambiguous reference resolution.
+- **8 node groups**: `table`, `query`, `form`, `report`, `macro`, `module`, `sql` (inline SQL), `field`.
+- **24+ edge kinds**: `relation`, `recordsource`, `recordsource-sql`, `controlsource`, `field-owner`, `sourceobject`, `rowsource`, `query-sql-reference`, `sql-reference`, `control-expression`, `vba-openform`, `vba-openreport`, `vba-openquery`, `vba-opentable`, `vba-querydefs`, `vba-runmacro`, `vba-runsql`, `vba-sourceobject`, `vba-type-ref`, `vba-data-ref`, `macro-openform`, `macro-openreport`, `macro-openquery`, `macro-runsql`.
+
+### Phases (executed in `ac_graph`)
+
+1. **Scan tables** (`scan_tables`): iterates `db.TableDefs`, skips system/temp tables, creates table + field nodes.
+2. **Scan relationships** (`scan_relationships`): calls `ac_list_relationships()`, creates relation edges.
+3. **Scan queries** (`scan_queries`): iterates `db.QueryDefs`, stores `.SQL` in `_sql_cache`.
+4. **Scan UI objects** (`scan_ui_objects`): enumerates forms/reports/macros/modules via `CurrentProject.All*`.
+5. **Finalize data names** (`finalize_data_names`): collects all table/query names for data-ref heuristic matching.
+6. **Analyze query edges** (`analyze_query_edges`): parses query SQL for table/query references via regex.
+7. **Analyze forms/reports** (`analyze_form_or_report`): extracts RecordSource, iterates controls for ControlSource/SourceObject/RowSource, runs VBA code heuristics on code-behind.
+8. **Analyze macros** (`analyze_macro`): parses macro export text for Action/Argument pairs (OpenForm, OpenReport, OpenQuery, RunSQL, SetProperty).
+9. **Analyze modules** (`analyze_module_code`): reads standalone module code, runs VBA heuristics.
+10. **Build output** (`build_output`): writes `graph.json` + optional embedded `index.html` viewer.
+
+### Field node modes
+
+- `"none"`: no field nodes created.
+- `"referenced"` (default): field nodes only for fields referenced by ControlSource bindings.
+- `"all"`: every field on every table gets a node.
+
+### VBA code heuristics (`_analyze_code_heuristics`)
+
+Scans VBA code for 7 `DoCmd.Open*`/`RunMacro` patterns, `RunSQL`/`Execute` with inline SQL, `SourceObject =` assignment, type references (`As ClassName`, `New ClassName`), and data references (table/query names in string literals). All patterns are case-insensitive.
+
+### SQL reference extraction (`_extract_sql_references`)
+
+Parses SQL text using regex for `FROM`, `JOIN`, `INTO`, `UPDATE`, `IN (...) SELECT` clauses. Strips brackets and aliases. Matches against known table/query names.
+
+### Output format
+
+- `graph.json`: `{meta: {database, generatedAt, fieldNodeMode, stats, warnings}, nodes: [...], edges: [...]}`
+- `index.html`: self-contained HTML viewer using vis-network from unpkg CDN. Graph data is injected via `var EMBEDDED_GRAPH = ...;` marker replacement. Supports dark/light mode, search, legend, group filtering.
+- `sql/` directory: inline SQL snippets saved as individual `.sql` files (SHA-1 hash naming).
+
+### Gotchas
+
+- Inline regex flags (`(?i)`) must appear at position 0 — Python 3.11+ rejects `r"^(?i)..."`. Use `re.I` flag parameter instead.
+- `_get_parsed_controls` now returns `source_object`, `row_source`, `link_master_fields`, `link_child_fields` in addition to existing properties.
+- Forms with subform/subreport controls trigger SourceObject edge detection; forms without code-behind still get RecordSource and control edges.
+
 ## Common Gotchas
 
 - VBE line numbers are **1-based**
@@ -172,7 +222,7 @@ Macros have always been fully supported via the regular code tools — no dedica
 
 - **Do NOT remove the `DispatchEx` fallback** in `_Session._launch()`. `_launch()` tries `GetActiveObject("Access.Application")` first to attach to a user's running Access (avoids spawning a second process); on failure it falls back to `DispatchEx`, which is required after `/decompile` kills to bypass stale ROT entries. Do NOT swap `DispatchEx` for `Dispatch` in the fallback — `Dispatch` latches onto the stale ROT entry.
 - **Do NOT call `cls._app.Quit()` unconditionally in `_decompile()` / `ac_decompile_compact()`**. Check `_Session._attached` first — when True we attached to the user's Access and must only `CloseCurrentDatabase()`, keeping the instance alive. Only when `_attached=False` (we spawned via `DispatchEx`) is `Quit(1)` safe. Same applies to the `atexit` handler `_Session.quit()`.
-- **Do NOT use `EnsureDispatch`** — it changes binding for all 61 tools and adds `gen_py` cache dependency.
+- **Do NOT use `EnsureDispatch`** — it changes binding for all 66 tools and adds `gen_py` cache dependency.
 - **Do NOT run `OpenCurrentDatabase` in a separate thread** — COM STA objects can only be used from the thread that created them.
 - **Do NOT call `CreateForm()` directly** — use `access_create_form` tool to avoid the "Save As" MsgBox.
 - **Do NOT change schemas to strict `"type": "integer"`** — MCP clients can't be trusted to send correct types.

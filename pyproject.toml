@@ -41,3 +41,6 @@ mcp-msaccess-database = "mcp_access.server:cli"
 [tool.setuptools]
 packages = ["mcp_access"]
 py-modules = ["access_mcp_server"]
+
+[tool.setuptools.package-data]
+mcp_access = ["viewer.html"]

@@ -1310,6 +1310,51 @@ TOOLS = [
             "required": ["db_path"],
         },
     ),
+    types.Tool(
+        name="access_graph",
+        description=(
+            "Build a dependency graph of the entire Access database — tables, "
+            "queries, forms, reports, macros, modules. Detects relationships, "
+            "RecordSource, ControlSource, SourceObject, RowSource, VBA code "
+            "heuristics (DoCmd.Open*, RunSQL, type refs, data refs), and "
+            "macro actions. Outputs graph.json + an interactive HTML viewer."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {
+                    "type": "string",
+                    "description": "Path to .accdb or .mdb file",
+                },
+                "out_dir": {
+                    "type": "string",
+                    "description": "Output directory (default: access-graph-out next to DB)",
+                },
+                "field_mode": {
+                    "type": "string",
+                    "enum": ["none", "referenced", "all"],
+                    "default": "referenced",
+                    "description": "Field node creation: none, referenced (controls only), all (every table field)",
+                },
+                "include_code_heuristics": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Scan VBA code for cross-references (DoCmd, type refs, data refs)",
+                },
+                "include_macro_heuristics": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Parse macros for OpenForm/OpenReport/RunSQL actions",
+                },
+                "embed_viewer": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Generate index.html with embedded graph viewer",
+                },
+            },
+            "required": ["db_path"],
+        },
+    ),
 ]
 
 # ---------------------------------------------------------------------------
