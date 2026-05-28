@@ -4,7 +4,7 @@
 
 **Give any AI assistant full control over Microsoft Access databases.**
 
-Create forms, write VBA, design tables, manage controls, run queries, build relationships, and edit every corner of an `.accdb` — all through natural language. 66 tools that turn Access into something you can *talk to*.
+Create forms, write VBA, design tables, manage controls, run queries, build relationships, and edit every corner of an `.accdb` — all through natural language. 67 tools that turn Access into something you can *talk to*.
 
 No Access expertise required. Just describe what you want.
 
@@ -85,7 +85,7 @@ Add to your MCP config file (`.mcp.json`, `mcp.json`, or client-specific setting
 
 Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 
-## Tools (66)
+## Tools (67)
 
 ### Database
 
@@ -251,6 +251,7 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 | Tool | Description |
 |------|-------------|
 | `access_graph` | Build a dependency graph of the entire database — tables, queries, forms, reports, macros, modules. Detects relationships, RecordSource, ControlSource, SourceObject, RowSource, VBA code heuristics, and macro actions. Outputs `graph.json` + interactive HTML viewer. Options: `field_mode` (none/referenced/all), `include_code_heuristics`, `include_macro_heuristics`, `embed_viewer` |
+| `access_graph_query` | Query a previously-generated graph without re-scanning the database. Actions: `neighbors` (connections to/from a node, depth 1-3), `impact` (transitive downstream dependents), `path` (shortest path between two nodes), `orphans` (nodes with no incoming edges), `summary` (stats + top-degree nodes). Loads `graph.json` from `access_graph` output |
 
 ### Cross-reference
 
@@ -327,6 +328,13 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 The MCP Python SDK (v1.26.0) has a catch-all `except Exception` in `mcp/shared/session.py` that swallows real errors and returns a generic `-32602` code with no detail. A local patch is applied to this machine that includes the actual exception and traceback in the error response. If you upgrade the `mcp` package, re-apply the patch — see `CLAUDE.md` for details.
 
 ## Changelog
+
+### v0.7.39 — 2026-05-28
+
+**New tool** — `access_graph_query`: query the dependency graph without re-scanning. **66 → 67 tools.**
+
+**Added**:
+- **`access_graph_query`** — pure-Python graph query tool that loads a previously-generated `graph.json` and answers targeted questions. Five actions: `neighbors` (BFS depth 1-3, directional), `impact` (transitive downstream walk), `path` (shortest path between two nodes), `orphans` (nodes with zero incoming edges), `summary` (stats + top-degree nodes). Smart node resolution (exact id, bare name, or group:name). `skip_fields` option to suppress noisy field-owner edges. Results capped at 200 items.
 
 ### v0.7.38 — 2026-05-28
 

@@ -28,7 +28,7 @@ MCP server for reading and editing Microsoft Access databases (`.accdb`/`.mdb`) 
 | **Maintenance** | `access_compact_repair`, `access_decompile_compact` |
 | **Screenshot & UI** | `access_screenshot`, `access_ui_click`, `access_ui_type` |
 | **Queries** | `access_manage_query` |
-| **Graph** | `access_graph` |
+| **Graph** | `access_graph`, `access_graph_query` |
 | **Indexes** | `access_list_indexes`, `access_manage_index` |
 | **VBA Compilation** | `access_compile_vba` |
 | **VBA Execution** | `access_run_macro`, `access_run_vba`, `access_eval_vba` |
@@ -166,6 +166,24 @@ Parses SQL text using regex for `FROM`, `JOIN`, `INTO`, `UPDATE`, `IN (...) SELE
 - `index.html`: self-contained HTML viewer using vis-network from unpkg CDN. Graph data is injected via `var EMBEDDED_GRAPH = ...;` marker replacement. Supports dark/light mode, search, legend, group filtering.
 - `sql/` directory: inline SQL snippets saved as individual `.sql` files (SHA-1 hash naming).
 
+### Querying the graph (`access_graph_query`)
+
+Pure-Python tool that loads `graph.json` and answers targeted questions without re-scanning the database:
+
+| Action | Purpose | Key params |
+|--------|---------|------------|
+| `summary` | Node/edge counts, top edge kinds, highest-degree nodes | `group` filter |
+| `neighbors` | Direct connections to/from a node (BFS depth 1-3) | `node`, `depth`, `direction` (in/out/both) |
+| `impact` | Transitive downstream walk — what breaks if this changes | `node` |
+| `path` | Shortest path between two nodes (undirected BFS) | `source`, `target` |
+| `orphans` | Nodes with zero incoming edges (dead objects) | — |
+
+Node resolution: accepts exact ids (`table:Customers`), bare names (`Customers`), or `group:name` format. Raises if ambiguous.
+
+`skip_fields=true` (default) excludes `field-owner` edges to reduce noise. Results capped at 200 items.
+
+**Recommended agent workflow**: run `access_graph` once, then use `access_graph_query` for targeted lookups before any mutation.
+
 ### Gotchas
 
 - Inline regex flags (`(?i)`) must appear at position 0 — Python 3.11+ rejects `r"^(?i)..."`. Use `re.I` flag parameter instead.
@@ -222,7 +240,7 @@ Parses SQL text using regex for `FROM`, `JOIN`, `INTO`, `UPDATE`, `IN (...) SELE
 
 - **Do NOT remove the `DispatchEx` fallback** in `_Session._launch()`. `_launch()` tries `GetActiveObject("Access.Application")` first to attach to a user's running Access (avoids spawning a second process); on failure it falls back to `DispatchEx`, which is required after `/decompile` kills to bypass stale ROT entries. Do NOT swap `DispatchEx` for `Dispatch` in the fallback — `Dispatch` latches onto the stale ROT entry.
 - **Do NOT call `cls._app.Quit()` unconditionally in `_decompile()` / `ac_decompile_compact()`**. Check `_Session._attached` first — when True we attached to the user's Access and must only `CloseCurrentDatabase()`, keeping the instance alive. Only when `_attached=False` (we spawned via `DispatchEx`) is `Quit(1)` safe. Same applies to the `atexit` handler `_Session.quit()`.
-- **Do NOT use `EnsureDispatch`** — it changes binding for all 66 tools and adds `gen_py` cache dependency.
+- **Do NOT use `EnsureDispatch`** — it changes binding for all 67 tools and adds `gen_py` cache dependency.
 - **Do NOT run `OpenCurrentDatabase` in a separate thread** — COM STA objects can only be used from the thread that created them.
 - **Do NOT call `CreateForm()` directly** — use `access_create_form` tool to avoid the "Save As" MsgBox.
 - **Do NOT change schemas to strict `"type": "integer"`** — MCP clients can't be trusted to send correct types.

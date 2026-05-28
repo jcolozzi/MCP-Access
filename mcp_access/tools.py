@@ -1355,6 +1355,68 @@ TOOLS = [
             "required": ["db_path"],
         },
     ),
+    types.Tool(
+        name="access_graph_query",
+        description=(
+            "Query a previously-generated Access dependency graph without "
+            "re-scanning the database. Actions: neighbors (direct connections), "
+            "impact (transitive downstream dependents), path (shortest path "
+            "between two nodes), orphans (nodes with no incoming edges), "
+            "summary (stats + top-degree nodes). Loads graph.json from "
+            "access_graph output."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["neighbors", "impact", "path", "orphans", "summary"],
+                    "description": "Query action to perform",
+                },
+                "graph_path": {
+                    "type": "string",
+                    "description": "Path to graph.json (from access_graph output). If omitted, looks for access-graph-out/graph.json next to db_path",
+                },
+                "db_path": {
+                    "type": "string",
+                    "description": "Path to .accdb — used to locate graph.json if graph_path not provided",
+                },
+                "node": {
+                    "type": "string",
+                    "description": "Node name or id for neighbors/impact (e.g. 'Customers' or 'table:Customers')",
+                },
+                "source": {
+                    "type": "string",
+                    "description": "Source node for path action",
+                },
+                "target": {
+                    "type": "string",
+                    "description": "Target node for path action",
+                },
+                "depth": {
+                    "type": "integer",
+                    "default": 1,
+                    "description": "BFS depth for neighbors (1-3)",
+                },
+                "direction": {
+                    "type": "string",
+                    "enum": ["in", "out", "both"],
+                    "default": "both",
+                    "description": "Edge direction for neighbors: in, out, or both",
+                },
+                "group": {
+                    "type": "string",
+                    "description": "Filter by node group for summary (table, query, form, report, macro, module)",
+                },
+                "skip_fields": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "Exclude field-owner edges from results (reduces noise)",
+                },
+            },
+            "required": ["action"],
+        },
+    ),
 ]
 
 # ---------------------------------------------------------------------------
