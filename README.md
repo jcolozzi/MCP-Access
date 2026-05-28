@@ -4,7 +4,7 @@
 
 **Give any AI assistant full control over Microsoft Access databases.**
 
-Create forms, write VBA, design tables, manage controls, run queries, build relationships, and edit every corner of an `.accdb` — all through natural language. 65 tools that turn Access into something you can *talk to*.
+Create forms, write VBA, design tables, manage controls, run queries, build relationships, and edit every corner of an `.accdb` — all through natural language. 66 tools that turn Access into something you can *talk to*.
 
 No Access expertise required. Just describe what you want.
 
@@ -25,6 +25,7 @@ The AI handles the COM automation, design view, VBA modules, binary sections, ca
 - **Tables & SQL** — create via DAO, alter, query, batch execute, full-text search across every Text/Memo field. Linked ODBC tables supported
 - **Relationships, indexes, references, queries, macros** — full CRUD. Clone any object (form / report / module / class / query / macro) preserving VBA and binary sections
 - **Maintenance** — compact & repair, decompile bloated databases, export structure docs. Office install autodetected (no more hardcoded Office 16 paths)
+- **Dependency graph** — build a vis.js interactive graph of every object and its connections (relationships, RecordSource, ControlSource, SourceObject, RowSource, VBA heuristics, macro actions). Opens in a browser
 
 Works with Claude Code, Cursor, Windsurf, Continue, or any MCP-compatible client.
 
@@ -84,7 +85,7 @@ Add to your MCP config file (`.mcp.json`, `mcp.json`, or client-specific setting
 
 Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 
-## Tools (61)
+## Tools (66)
 
 ### Database
 
@@ -245,6 +246,12 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 | `access_ui_click` | Click at image coordinates on the Access window. Coordinates are relative to a previous screenshot (`image_width` required for scaling). Supports `left`, `double`, and `right` click |
 | `access_ui_type` | Type text or send keyboard shortcuts. `text` for normal characters (WM_CHAR), `key` for special keys (enter, tab, escape, f1-f12, arrows, etc.), `modifiers` for combos (ctrl, shift, alt) |
 
+### Dependency graph
+
+| Tool | Description |
+|------|-------------|
+| `access_graph` | Build a dependency graph of the entire database — tables, queries, forms, reports, macros, modules. Detects relationships, RecordSource, ControlSource, SourceObject, RowSource, VBA code heuristics, and macro actions. Outputs `graph.json` + interactive HTML viewer. Options: `field_mode` (none/referenced/all), `include_code_heuristics`, `include_macro_heuristics`, `embed_viewer` |
+
 ### Cross-reference
 
 | Tool | Description |
@@ -320,6 +327,18 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 The MCP Python SDK (v1.26.0) has a catch-all `except Exception` in `mcp/shared/session.py` that swallows real errors and returns a generic `-32602` code with no detail. A local patch is applied to this machine that includes the actual exception and traceback in the error response. If you upgrade the `mcp` package, re-apply the patch — see `CLAUDE.md` for details.
 
 ## Changelog
+
+### v0.7.38 — 2026-05-28
+
+**New tool** — `access_graph`: database dependency graphing. **65 → 66 tools.**
+
+**Added**:
+- **`access_graph`** — build a vis.js-compatible dependency graph of the entire Access database. Scans all tables, queries, forms, reports, macros, and modules. Detects relationships, RecordSource, ControlSource, SourceObject, RowSource, VBA code heuristics (DoCmd.Open*, RunSQL, QueryDefs, type refs, data refs in string literals), and macro actions (OpenForm, OpenReport, OpenQuery, RunSQL, SetProperty). Outputs `graph.json` (nodes + edges) and an interactive `index.html` viewer with dark/light mode, search, legend, and group filtering. Options: `field_mode` (none / referenced / all), `include_code_heuristics`, `include_macro_heuristics`, `embed_viewer`, `out_dir`.
+- **`_parse_controls` extended**: now returns `source_object`, `row_source`, `link_master_fields`, `link_child_fields` in addition to existing control properties.
+- **`pyproject.toml`**: `viewer.html` added to package data.
+
+**Fixed**:
+- Inline regex flag `(?i)` after `^` anchor caused `"global flags not at the start of the expression"` on Python 3.11+. Changed to `re.I` flag parameter.
 
 ### v0.7.37 — 2026-05-26
 
