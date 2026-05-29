@@ -339,14 +339,56 @@ The MCP Python SDK (v1.26.0) has a catch-all `except Exception` in `mcp/shared/s
 ### v0.7.38 — 2026-05-28
 
 **New tool** — `access_graph`: database dependency graphing. **65 → 66 tools.**
+DX fixes for form-building workflows, found while assembling a non-trivial form
+(modes + ListBox cesta + 23 controls + 589 LOC VBA) end-to-end in a single MCP
+session.
 
 **Added**:
 - **`access_graph`** — build a vis.js-compatible dependency graph of the entire Access database. Scans all tables, queries, forms, reports, macros, and modules. Detects relationships, RecordSource, ControlSource, SourceObject, RowSource, VBA code heuristics (DoCmd.Open*, RunSQL, QueryDefs, type refs, data refs in string literals), and macro actions (OpenForm, OpenReport, OpenQuery, RunSQL, SetProperty). Outputs `graph.json` (nodes + edges) and an interactive `index.html` viewer with dark/light mode, search, legend, and group filtering. Options: `field_mode` (none / referenced / all), `include_code_heuristics`, `include_macro_heuristics`, `embed_viewer`, `out_dir`.
 - **`_parse_controls` extended**: now returns `source_object`, `row_source`, `link_master_fields`, `link_child_fields` in addition to existing control properties.
 - **`pyproject.toml`**: `viewer.html` added to package data.
+- **`ac_create_control` accepts a top-level `control_name`** in addition to
+  the historical `{"Name": "..."}` inside `props`. Without this you had to
+  discover that the new control got an auto-name like `Command1` / `Label2`
+  and rename it via a second `set_control_props` call. `props["Name"]` still
+  wins if both are provided — old fixtures don't change.
 
 **Fixed**:
 - Inline regex flag `(?i)` after `^` anchor caused `"global flags not at the start of the expression"` on Python 3.11+. Changed to `re.I` flag parameter.
+- **`ac_set_code(form|report)` failed with `errors while importing` on a
+  freshly-created form.** Pure VBA (`Option Compare Database` + `Private Sub
+  btCerrar_Click ...`) is not a valid form text export — but `LoadFromText`
+  was called unconditionally, and `restore_binary_sections` only works
+  against a baseline that exists on disk. New forms created via
+  `ac_create_form` have no such baseline, so the import bailed and rolled
+  back. v0.7.38 detects VBA-only input (`_looks_like_vba_only`) and routes it
+  through `_inject_vba_after_import`: open in Design view → activate
+  `HasModule` → write the VBA through VBE. The form layout is preserved, no
+  `LoadFromText` is attempted. A complete form export (with `Version =` /
+  `Begin Form`) still takes the original path.
+- **VBE reads on a brand-new form raised `Subscript out of range`** with the
+  error pointing at *Trust access to the VBA project object model* in the
+  Trust Center — the actual cause was `HasModule=False`. `_force_vbe_init`
+  now flips `HasModule` to True when opening the form/report in Design view
+  during the retry, so `access_vbe_module_info` / `_get_lines` / `_search_all`
+  on a form just made by `ac_create_form` no longer needs a manual
+  `set_form_property({"HasModule": true})` round-trip. The fallback error
+  message is also rewritten so it tells you about `HasModule` before blaming
+  Trust Center, when the object_type is form/report.
+- **`ac_create_control` rejected `Parent` (capital P)** with `Property
+  'CreateControl.Parent' can not be set`. Special keys (`section`, `parent`,
+  `column_name`, `left`, `top`, `width`, `height`) are now popped from
+  `props` case-insensitively, so dropping a control into a TabControl Page
+  works whether you pass `{"parent": "tabGestion"}` or `{"Parent":
+  "tabGestion"}`. Same goes for `Left`/`Top`/etc.
+- **`ac_create_control` lost properties Access only exposes via the
+  `Properties` collection.** Some props raise on `setattr(ctrl, "X", val)`
+  but succeed via `ctrl.Properties("X").Value = val` (e.g. `ScrollBars` on
+  certain control types). The prop loop now retries via the Properties
+  collection before recording an entry in `property_errors`. Props that
+  genuinely don't exist on the target control (e.g. the UserForm-only
+  `MultiLine` on an Access TextBox — Access uses `EnterKeyBehavior` instead)
+  still fail loudly.
 
 ### v0.7.37 — 2026-05-26
 

@@ -28,6 +28,61 @@ _AC_SAVE_YES = 1   # acSaveYes
 _AC_REPORT   = 3   # acReport
 
 
+# ---------------------------------------------------------------------------
+# Heuristics: distinguish a full form/report text export from raw VBA code
+# ---------------------------------------------------------------------------
+
+# A form/report text export ALWAYS starts (after optional BOM/whitespace) with
+# `Version =NN` on the FIRST non-blank line, followed by `VersionRequired`,
+# `Checksum`, `Begin Form`/`Begin Report`, etc. We anchor to the head of the
+# file to avoid false positives from VBA comments that mention "Begin Form"
+# or strings containing "Version =".
+#
+# Heuristic order:
+#   1. Strip BOM and leading whitespace/blank lines.
+#   2. If the first non-blank line matches `Version =NN` → form export.
+#   3. Else, if `Option Compare` / `Option Explicit` / Sub/Function/etc.
+#      appears in the first ~20 lines → VBA-only.
+#   4. Else → treat as form export (legacy behaviour) to be safe — strict
+#      callers can prepend `Option Compare Database` to force VBE injection.
+_FIRST_LINE_VERSION_RE = re.compile(
+    r"^Version\s*=\s*\d+",
+    re.IGNORECASE,
+)
+_VBA_HINT_RE = re.compile(
+    r"^\s*(Option\s+(Compare|Explicit|Base|Private)\b|"
+    r"(Public|Private|Friend)?\s*(Static\s+)?(Sub|Function|Property|Const|Dim|Type|Enum)\b)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _looks_like_vba_only(code: str) -> bool:
+    """True when `code` is plain VBA (no form/report definition).
+
+    Used by ac_set_code to take the VBE-injection shortcut for existing
+    forms/reports instead of round-tripping through LoadFromText. The
+    detector anchors to the head of the file (first non-blank line) so a
+    VBA comment like ``' Begin Form: this proc opens ...`` does NOT
+    classify the code as a form export by mistake.
+
+    Returns False on empty/whitespace-only input so the legacy
+    LoadFromText path stays out of the way for the no-op case.
+    """
+    if not code or not code.strip():
+        return False
+    # Strip BOM and find first non-blank line
+    head = code.lstrip("﻿").lstrip()
+    first_line = head.split("\n", 1)[0].strip()
+    if _FIRST_LINE_VERSION_RE.match(first_line):
+        # Genuine form/report text export — let LoadFromText handle it.
+        return False
+    # Probe the first 20 lines for VBA hints. We bound the search so a stray
+    # `Option` deep inside a multi-thousand-line form text export doesn't
+    # accidentally re-route to VBE injection.
+    head_lines = "\n".join(head.split("\n")[:20])
+    return bool(_VBA_HINT_RE.search(head_lines))
+
+
 def _open_in_design(app: Any, object_type: str, object_name: str) -> None:
     """Opens a form/report in Design view."""
     try:
@@ -323,6 +378,13 @@ def ac_set_code(db_path: str, object_type: str, name: str, code: str) -> str:
     split: first the form/report is imported without VBA, then the VBA code is injected
     via VBE (avoiding encoding issues with LoadFromText).
 
+    **VBA-only shortcut for existing forms/reports** (v0.7.38):
+    If the caller passes only VBA code (starts with Option/Sub/Function/etc.,
+    no `Version =`, `Begin Form`, etc.) for an existing form/report, the layout
+    is preserved and the VBA is injected via VBE — no LoadFromText round-trip
+    that would otherwise fail with "errors while importing" on forms that have
+    not yet been exported to text (e.g. just created with ac_create_form).
+
     object_type='class_module' creates a VBA class module: the canonical
     `VERSION 1.0 CLASS` header is prepended automatically if missing.
     """
@@ -338,6 +400,18 @@ def ac_set_code(db_path: str, object_type: str, name: str, code: str) -> str:
     # Split CodeBehindForm/CodeBehindReport if present
     vba_code = ""
     if object_type in ("form", "report"):
+        # Shortcut: if the caller passes VBA-only code for an existing
+        # form/report, inject it via VBE instead of re-importing the whole
+        # form definition (which fails for freshly-created forms with no
+        # prior SaveAsText baseline).
+        if _looks_like_vba_only(code) and _object_exists(app, object_type, name):
+            _inject_vba_after_import(app, object_type, name, code)
+            invalidate_object_caches(object_type, name)
+            return (
+                f"OK: VBA injected into existing {object_type} '{name}' "
+                f"via VBE (layout preserved, no LoadFromText round-trip)"
+            )
+
         code, vba_code = _split_code_behind(code)
         # Remove HasModule from form text — it will be activated when injecting VBA
         if vba_code:
