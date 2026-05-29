@@ -76,6 +76,70 @@ _MACRO_ACTIONS: dict[str, tuple[str, str, str]] = {
     "OpenTable":  ("table",  "OpenTable",  "macro-opentable"),
 }
 
+# Regex to extract Public Sub/Function/Property declarations from VBA code.
+# Captures the procedure name.  Implicit Public (no Private keyword) counts.
+_VBA_PROC_DECL_RE = re.compile(
+    r"^\s*(?:Public\s+)?"
+    r"(?:Sub|Function|Property\s+(?:Get|Let|Set))"
+    r"\s+(\w+)",
+    re.MULTILINE | re.IGNORECASE,
+)
+_VBA_PRIVATE_PROC_RE = re.compile(
+    r"^\s*Private\s+(?:Sub|Function|Property\s+(?:Get|Let|Set))"
+    r"\s+(\w+)",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+# Built-in VBA / Access function names to exclude from cross-module call
+# detection.  All lowercase.
+_VBA_BUILTIN_NAMES: set[str] = {
+    # String functions
+    "asc", "ascw", "chr", "chrw", "format", "instr", "instrb",
+    "instrrev", "join", "lcase", "left", "len", "lenb", "ltrim",
+    "mid", "replace", "right", "space", "split", "str", "strcomp",
+    "strconv", "strreverse", "trim", "rtrim", "ucase", "val", "string",
+    # Type conversion
+    "cbool", "cbyte", "ccur", "cdate", "cdbl", "cdec", "cint",
+    "clng", "clnglng", "clngptr", "csng", "cstr", "cvar", "cverr",
+    # Type checking
+    "isarray", "isdate", "isempty", "iserror", "ismissing",
+    "isnull", "isnumeric", "isobject", "typename", "vartype",
+    # Math
+    "abs", "atn", "cos", "exp", "fix", "int", "log", "rnd",
+    "round", "sgn", "sin", "sqr", "tan",
+    # Date/Time
+    "date", "dateadd", "datediff", "datepart", "dateserial",
+    "datevalue", "day", "formatdatetime", "hour", "minute",
+    "month", "monthname", "now", "second", "time", "timeserial",
+    "timevalue", "timer", "weekday", "weekdayname", "year",
+    # I/O
+    "inputbox", "msgbox",
+    # File
+    "curdir", "dir", "eof", "filecopy", "filedatetime", "filelen",
+    "freefile", "getattr", "loc", "lof", "setattr",
+    # Array
+    "array", "erase", "filter", "lbound", "ubound",
+    # Interaction / System
+    "appactivate", "beep", "command", "doevents", "environ",
+    "sendkeys", "shell",
+    # Error
+    "error",
+    # Object / Reference
+    "callbyname", "createobject", "getobject",
+    # Registry
+    "deletesetting", "getsetting", "savesetting",
+    # Number conversion
+    "hex", "oct",
+    # Miscellaneous
+    "choose", "iif", "nz", "partition", "qbcolor", "randomize", "rgb",
+    # Access domain aggregates
+    "davg", "dcount", "dfirst", "dlast", "dlookup", "dmax", "dmin",
+    "dstdev", "dstdevp", "dsum", "dvar", "dvarp",
+    # Access system
+    "codedb", "currentdb", "currentuser", "eval", "guidfromstring",
+    "hyperlinkpart", "stringfromguid", "syscmd",
+}
+
 
 # ---------------------------------------------------------------------------
 # GraphBuilder
@@ -102,6 +166,14 @@ class GraphBuilder:
 
         # Populated during scan; sorted desc by length for matching
         self._known_data_names: list[str] = []
+
+        # Cross-module call detection (populated by build_proc_index)
+        # proc_name_lower -> list of module node_ids that define it
+        self._proc_index: dict[str, list[str]] = defaultdict(list)
+        # Compiled regex for matching procedure calls (built lazily)
+        self._proc_call_re: re.Pattern | None = None
+        # Cache of module code read during proc index building
+        self._module_code_cache: dict[str, str] = {}
 
     # ── node / edge primitives ──────────────────────────────────────────
 
@@ -354,6 +426,79 @@ class GraphBuilder:
                 if e["is_data"]:
                     names.add(e["name"])
         self._known_data_names = sorted(names, key=len, reverse=True)
+
+    def build_proc_index(self, db_path: str) -> None:
+        """Pass 1: index all Public procedures across standalone modules.
+
+        Reads each module's VBA code via VBE (with SaveAsText fallback),
+        extracts Public Sub/Function/Property declarations, and builds
+        ``self._proc_index`` for cross-module call detection.
+        Code is cached in ``self._module_code_cache`` to avoid re-reading
+        during ``analyze_module_code()``.
+        """
+        from .vbe import _get_code_module, _cm_all_code
+
+        app = _Session.connect(db_path)
+        module_names: list[str] = []
+        try:
+            for item in app.CurrentProject.AllModules:
+                name: str = item.Name
+                if not _is_system(name):
+                    module_names.append(name)
+        except Exception:
+            return
+
+        for mod_name in module_names:
+            node_id = self._object_id("module", mod_name)
+            if not self._node_exists(node_id):
+                continue
+
+            # Read module code (cache for later heuristic analysis)
+            code = ""
+            try:
+                cm = _get_code_module(app, "module", mod_name)
+                code = _cm_all_code(cm, f"module:{mod_name}")
+            except Exception:
+                try:
+                    code = ac_get_code(db_path, "module", mod_name)
+                except Exception:
+                    continue
+            if not code:
+                continue
+
+            self._module_code_cache[mod_name] = code
+
+            # Find all Private proc names so we can exclude them
+            private_names = {
+                m.group(1).lower()
+                for m in _VBA_PRIVATE_PROC_RE.finditer(code)
+            }
+
+            # Find all proc declarations (Public or implicit Public)
+            for m in _VBA_PROC_DECL_RE.finditer(code):
+                proc_name = m.group(1)
+                pname_lower = proc_name.lower()
+                # Skip Private procs, built-ins, and very short names
+                if pname_lower in private_names:
+                    continue
+                if pname_lower in _VBA_BUILTIN_NAMES:
+                    continue
+                if len(pname_lower) < 2:
+                    continue
+                self._proc_index[pname_lower].append(node_id)
+
+        # Build compiled regex for call detection
+        proc_names = sorted(self._proc_index.keys(), key=len, reverse=True)
+        if proc_names:
+            escaped = [re.escape(n) for n in proc_names]
+            alt = "|".join(escaped)
+            # Match bare calls: ProcName( — but NOT object.ProcName(
+            # Also match: Call ProcName
+            self._proc_call_re = re.compile(
+                rf"(?<![.\w])(?:{alt})\s*\("
+                rf"|\bCall\s+(?:{alt})\b",
+                re.IGNORECASE,
+            )
 
     # ── Phase 3: form/report edge detection ─────────────────────────────
 
@@ -614,6 +759,29 @@ class GraphBuilder:
                             "vba-type-ref", "to", {"name": tgt_name},
                         )
 
+        # Cross-module procedure calls (bare FuncName( or Call SubName)
+        if self._proc_call_re:
+            seen_call: set[str] = set()
+            for m in self._proc_call_re.finditer(code):
+                matched = m.group(0)
+                # Extract the procedure name from the match
+                # Strip leading 'Call ' if present, trailing '(' or whitespace
+                proc_name = re.sub(
+                    r"^\s*Call\s+", "", matched, flags=re.I
+                ).rstrip("( \t")
+                pname_lower = proc_name.lower()
+                target_ids = self._proc_index.get(pname_lower, [])
+                for tid in target_ids:
+                    if tid == owner_id:
+                        continue  # skip self-edges
+                    edge_key = f"{owner_id}->{tid}:call:{pname_lower}"
+                    if edge_key not in seen_call:
+                        seen_call.add(edge_key)
+                        self.add_edge(
+                            owner_id, tid, "calls",
+                            "vba-call", "to", {"procedure": proc_name},
+                        )
+
         # Data references in string literals
         if self._known_data_names:
             literals = _VBA_STRING_LITERAL_RE.findall(code)
@@ -707,17 +875,20 @@ class GraphBuilder:
         node_id = self._object_id("module", module_name)
         if not self._node_exists(node_id):
             return
-        try:
-            from .vbe import _get_code_module, _cm_all_code
-            app = _Session.connect(db_path)
-            cm = _get_code_module(app, "module", module_name)
-            code = _cm_all_code(cm, f"module:{module_name}")
-        except Exception:
-            # Fallback: try SaveAsText export
+
+        # Use cached code from build_proc_index() if available
+        code = self._module_code_cache.get(module_name, "")
+        if not code:
             try:
-                code = ac_get_code(db_path, "module", module_name)
+                from .vbe import _get_code_module, _cm_all_code
+                app = _Session.connect(db_path)
+                cm = _get_code_module(app, "module", module_name)
+                code = _cm_all_code(cm, f"module:{module_name}")
             except Exception:
-                return
+                try:
+                    code = ac_get_code(db_path, "module", module_name)
+                except Exception:
+                    return
         if code:
             self._analyze_code_heuristics(
                 node_id, "module", module_name, code, sql_dir
@@ -950,6 +1121,10 @@ def ac_graph(
     gb.scan_queries(app, db)
     gb.scan_ui_objects(app)
     gb.finalize_data_names()
+
+    # Build cross-module procedure index (must precede code heuristics)
+    if include_code_heuristics:
+        gb.build_proc_index(db_path)
 
     # Phase 5 (queries first — order doesn't affect correctness)
     gb.analyze_query_edges(app, db, sql_dir)
