@@ -11,15 +11,16 @@ MCP server for reading and editing Microsoft Access databases (`.accdb`/`.mdb`) 
 - **Caches**: `_parsed_controls_cache` (control parsing) and `_Session._cm_cache` (CodeModule COM objects — live COM proxies). Both invalidated on DB switch, object modification, and design operations. There is **no** Python-side cache of VBE text: `_cm_all_code()` always reads via `cm.Lines(1, total)` so external edits (manual VBE edits, Ctrl+Z, add-ins) are picked up immediately. See issue #26 for the reason this cache was removed.
 - **Binary section handling**: `ac_get_code` strips PrtMip/PrtDevMode from form/report exports; `ac_set_code` restores them automatically before import.
 
-## Tools (66 total)
+## Tools (69 total)
 
 | Category | Tools |
 |----------|-------|
 | **Database** | `access_create_database`, `access_close` |
-| **Objects** | `access_list_objects`, `access_get_code`, `access_set_code`, `access_export_structure`, `access_delete_object`, `access_create_form`, `access_clone_object` |
+| **Objects** | `access_list_objects`, `access_get_code`, `access_set_code`, `access_export_structure`, `access_delete_object`, `access_create_form`, `access_build_form`, `access_clone_object` |
 | **SQL/Tables** | `access_execute_sql`, `access_execute_batch`, `access_table_info`, `access_search_queries`, `access_search_data`, `access_create_table`, `access_alter_table` |
 | **VBE line-level** | `access_vbe_get_lines`, `access_vbe_get_proc`, `access_vbe_module_info`, `access_vbe_replace_lines`, `access_vbe_find`, `access_vbe_search_all`, `access_vbe_replace_proc`, `access_vbe_patch_proc`, `access_vbe_append` |
 | **Controls** | `access_list_controls`, `access_get_control`, `access_create_control`, `access_delete_control`, `access_set_control_props`, `access_set_multiple_controls`, `access_manage_tab_order` |
+| **UI lint** | `access_lint_form` |
 | **DB Properties** | `access_get_db_property`, `access_set_db_property`, `access_get_form_property`, `access_set_form_property` |
 | **Text Export/Import** | `access_export_text`, `access_import_text` |
 | **Linked Tables** | `access_list_linked_tables`, `access_relink_table` |
@@ -84,6 +85,21 @@ Passing VBE-style headers to `LoadFromText` creates a corrupt standard module. `
 
 ### Dialog watchdog system
 Blocking COM calls (`OpenCurrentDatabase`, `CompactRepair`, `RunCommand`, `Application.Run`) are protected by polling watchdog threads that dismiss Access dialogs via `_dismiss_access_dialogs()` / `_dismiss_dialogs_by_pid()`. Button priority: Cancel > End > OK (Cancel-first avoids advancing wizards).
+
+**Attached-instance policy (v0.7.43)**: the global watchdog also runs when we attached to the user's Access, but it only dismisses dialogs while one of OUR tool calls has been in flight longer than the grace period (5 s attached vs 3 s spawned). `_Session._tool_started` (monotonic timestamp, set/cleared by `server.call_tool` around `run_in_executor`) is the in-flight signal. A modal with no tool call in flight belongs to the interactive user — never touched. Do NOT "simplify" this back to disabling the watchdog on attach: that re-introduces the 1-hour VBE hang when a broken-reference VBA project pops "Error accessing file..." during one of our calls.
+
+**Dismissal note (v0.7.44, issue #31)**: `_dismiss_dialogs_by_pid` (the funnel every watchdog goes through) records `(monotonic, title)` in `_Session._last_dismissed`; `server.call_tool` appends a "a modal dialog (X) was auto-dismissed during this call" note to the tool result when the timestamp falls inside the call. Cancel-first dismissal can alter outcomes (e.g. cancel a save prompt) — the note makes that traceable instead of silent.
+
+**Eval/delete hardening (v0.7.44, issue #31)**:
+- `ac_eval_vba` accepts optional `timeout` with the same `_dialog_watchdog` treatment as `ac_run_vba`, wrapping BOTH `Application.Eval` and the temp-module fallback.
+- `_eval_via_temp_module` sweeps orphan `_mcp_eval_wrapper` temp modules (`_sweep_orphan_eval_modules`, marker in the first 10 lines of std modules only) before creating a new one — a failed `Remove` used to wedge every later call with "cannot find the procedure 'Module1._mcp_eval_wrapper'". Deliberately NOT in `connect()`: that would cost VBE access (Trust Center + Visible) on every tool call.
+- `ac_delete_object` calls `_save_all_modules(app)` (best-effort: `RunCommand 280` = acCmdSaveAllModules, fallback per-module `DoCmd.Save`) before `DoCmd.DeleteObject` to prevent the "save changes to the design of module X?" prompt — dirty state can come from user code run via eval, so per-tool bookkeeping isn't enough. Do NOT extend this to close/quit paths: on attached instances it would silently persist the interactive user's half-finished VBE edits.
+
+### Wedged-session detection (v0.7.43, from PR #30 by @CaptainStormfield)
+A DB whose startup code closes it during the open (startup-form error path + `AllowBypassKey=False`) used to leave `_db_open` pointing at a dead database — every later call died at `CurrentDb` and reconnects re-attached to the same broken instance. Now: `_switch()` validates `CurrentDb() is not None` post-open (raises an actionable RuntimeError after `quit()`-resetting the session), `connect()` health-checks `CurrentDb()` whenever `_db_open` is set (auto-reconnect via `_force_cleanup()`), and `ac_create_database` validates its reopen. Cost: one extra `CurrentDb()` COM round-trip per tool call — accepted trade-off.
+
+### Multi-object scans must not lie with "0 matches" (v0.7.43)
+`ac_vbe_search_all` / `ac_find_usages` / `ac_find_definition` collect per-object failures into `errors` (capped at `_SEARCH_ERROR_CAP = 20`) + `objects_skipped` + a `warning`, instead of `except: continue`. A VBA project that fails to load (broken reference, Trust Center) makes EVERY object fail — a clean `total: 0` was a false "doesn't exist". Same idea in `ac_list_references`: each reference property is read defensively (broken references raise `com_error` on `FullPath`), never kill the listing.
 
 ### Application.Run via InvokeTypes
 `Application.Run` has 31 params (1 required + 30 optional). pywin32's late-bound `Dispatch` can't handle this. `_invoke_app_run()` calls `_oleobj_.InvokeTypes()` directly with `pythoncom.Missing` padding. Same approach for `Application.Eval` via `_invoke_app_eval()`.
@@ -190,6 +206,180 @@ Node resolution: accepts exact ids (`table:Customers`), bare names (`Customers`)
 - `_get_parsed_controls` now returns `source_object`, `row_source`, `link_master_fields`, `link_child_fields` in addition to existing properties.
 - Forms with subform/subreport controls trigger SourceObject edge detection; forms without code-behind still get RecordSource and control edges.
 
+## UI design lint (v0.7.41)
+
+`mcp_access/lint.py` is a **deterministic, pure-Python** design validator (no
+LLM, no external service). `access_lint_form` returns structured JSON
+violations; the same engine runs **automatically** on every design mutation.
+
+### Why it exists
+The LLM sets control coordinates/colours blind and used to accept objectively
+broken layouts (white-on-white, overlap, truncation, inconsistent siblings,
+out-of-bounds). The fix the user asked for: validation that lives *inside* the
+MCP and **cannot be skipped or "talked past"** by the model. So the rules are
+numeric and the result is attached to mutations whether the model asks or not.
+
+### Architecture
+- One SaveAsText export (via `ac_get_code`, binary sections already stripped),
+  never opens Design view. `_build_model` layers a style dict (`_extract_style`,
+  reading the control's `raw_block`) and section assignment onto the cached
+  `_parse_controls` result, plus `_parse_geometry` (form Width/BackColor +
+  per-section Height/BackColor/line-range).
+- Rules: `contrast` (WCAG 2.1, `_decode_bgr`+`_contrast_ratio`), `overlap`
+  (AABB, same section+parent only), `out_of_bounds`, `truncation`,
+  `sibling_inconsistency`, `misalignment`, `invisible_or_zero_size`.
+- `lint_compact()` (errors+warnings, heuristic measure, capped) is attached by
+  `_attach_lint` to the result of `ac_set_control_props`,
+  `ac_set_multiple_controls`, `ac_create_control`. Wrapped in try/except so a
+  lint failure NEVER breaks the mutation. `skip_lint=true` opts out for bulk ops.
+
+### Hard-won gotchas baked into the rules (do NOT "simplify" these away)
+- **Absent dimension ≠ 0.** Access omits `Left/Top/Width/Height` (and `BackColor`)
+  when they equal the form default. `_twips_opt` returns None for absent; rules
+  use `_has_full_geom` and skip None. Treating absent as 0 caused false
+  "zero-size" / bounds violations on inherited-default controls.
+- **Opaque text control with no `BackColor` renders on white.** Access omits the
+  default white BackColor — this is exactly how white-on-white slips through, so
+  `_effective_background` defaults Label/TextBox/ComboBox/ListBox to white.
+- **`ControlType =` is often absent** in modern exports; type comes from the
+  `Begin <Type>` keyword. Rules key off `type_name`, not the int.
+- **Attached labels are nested inside their control's block** → `_parse_controls`
+  never enumerates them, so no overlap false positives there for free.
+- **Access auto-grows form Width (and section Height) to fit controls**, so
+  horizontal `out_of_bounds` rarely fires for forms (still useful for reports +
+  negative coords). Not a bug — documented limitation.
+- **`ConditionalFormat = Begin … End`** holds its own colours; `_extract_style`
+  tracks block depth so only the control's own (depth-1) props are read.
+- **System/theme colours** have the high bit `0x80000000` (e.g. `-2147483633`) —
+  `_decode_bgr` flags them; contrast emits an `info` note instead of a number.
+- **Conditional formatting** (`format_conditions`) overrides ForeColor/BackColor
+  at runtime and is BINARY in the export — `_rule_contrast` skips those controls
+  and notes them (can't verify the runtime colour statically).
+- **Captions wrap.** Both Labels AND CommandButtons wrap their caption across
+  lines; SaveAsText encodes the breaks as literal `\015\012`. `_caption_lines`
+  splits them; truncation counts how many display lines the text needs
+  (`ceil(line_width/avail)`) vs how many fit the height (`round(height/lineH)`,
+  `lineH ≈ fontPt*20*1.2`). A 540-twip button shows 2 lines of 11pt — use
+  `round`, not `floor`, or you under-count and false-flag.
+- **Heuristic width is approximate.** Narrow UI fonts (Calibri/Tahoma) average
+  ~0.46× the point size per glyph; the heuristic only flags a line as
+  overflowing past **1.25×** the available width (absorbs metric error). WizHook
+  uses 1.02×. Without these, bold header labels that fit get false-flagged.
+- **Transparent buttons are a click layer, not an overlap.** A `Transparent=True`
+  CommandButton stacked on a styled Label/Rectangle is the standard Access
+  custom-button pattern (the label shows the colour, the invisible button takes
+  the click) — `_rule_overlap` skips any pair where one side is a transparent
+  button. (Classic command buttons ignore `BackColor` even with `UseTheme=No`
+  on Win11/Office16, so this label+transparent-button trick is how you get
+  coloured tiles.)
+- **`sibling_inconsistency` clusters, not modes.** A form legitimately uses two
+  sizes (tall main buttons + a row of short inline buttons). `_accepted_clusters`
+  treats any value ≥2 controls share as a norm; only a lone outlier (and not a
+  >2× different class like a memo box) is flagged. Needs ≥4 controls in the group.
+
+### WizHook text measurement
+`measure="auto"|"wizhook"|"heuristic"`. WizHook (`_measure_text_batch`) measures
+exact rendered width in ONE COM round-trip via a temp std module +
+`_invoke_app_run`. It REQUIRES a compiled VBA project (`Application.IsCompiled`);
+during active development the ERP project is usually uncompiled, so it fails and
+falls back to the conservative heuristic (a `note` is added when `measure` was
+explicitly `wizhook`). The embedded lint always uses `heuristic` (fast, no Run
+dependency). Default everywhere leans on the heuristic for reliability.
+
+## Declarative form auto-layout (v0.7.45)
+
+The LLM is poor at emitting absolute twip coordinates blind (overlaps,
+out-of-bounds, ragged columns, invented colours). The fix is to take the
+arithmetic away from the model — the same idea as the lint, applied at
+*generation* time instead of validation time.
+
+### Pieces
+- **`mcp_access/design_defaults.py`** — the single source of truth for layout
+  tokens: the 60-twip grid (`GRID`), margins/gaps, standard control sizes
+  (`ROW_H=300`, `LABEL_W=1800`, `FIELD_W=2400`, `BUTTON_W/H`, `MEMO_H`…),
+  fonts, and a **closed BGR palette** (`PALETTE`). `bgr(r,g,b)` builds an Access
+  colour Long (BGR order, NOT RGB); `snap(v)` rounds to the grid. `lint.py`,
+  `build_form.py` and `tips('layout')` all read from here — change a number once.
+- **`access_build_form`** (`mcp_access/build_form.py`) — declarative form
+  builder. The model passes a spec (`title`, ordered `fields`, `actions`,
+  `layout` single|two-column, `theme` light|plain); `_plan_layout` (pure, unit
+  tested in `tests/test_build_form_layout.py`) computes every rect from
+  `design_defaults`; `ac_build_form` creates all controls in **one** Design-view
+  session, sets the palette, sizes the form + header/footer sections, assigns a
+  per-section tab order, then attaches the embedded lint. A form it builds passes
+  the lint clean by construction.
+- **`snap_to_grid`** (opt-in, default false) on `ac_create_control` /
+  `ac_set_control_props` — rounds Left/Top/Width/Height to `GRID`. `-1` (auto)
+  values are left untouched.
+
+### Gotchas baked in
+- `_plan_layout` references `_PREFIX` / `_looks_unbound` defined *below* it —
+  fine because both are module globals resolved at call time, not import time.
+- Two-column mode ignores `width_units` (keeps a strict grid); single-column
+  honours it. Memo fields use `MEMO_H` and advance the running `y` cursor so
+  taller rows don't overlap the next.
+- A field name with spaces/operators is left **unbound** (`_looks_unbound`) — a
+  plain column name gets a `ControlSource`. `theme="plain"` emits geometry only
+  (no colours/fonts).
+- `has_header` toggles BOTH FormHeader and FormFooter; when only one is needed
+  the other section's Height is set to 0.
+
+### New lint rules (v0.7.45) — all `info`-severity
+`grid_alignment`, `spacing_consistency`, `edge_margin`, `hierarchy`. They enrich
+the full `access_lint_form` report but **never** change the verdict (which only
+counts errors/warnings) and **never** reach `lint_compact` (errors+warnings
+only), so they can't make the embedded mutation lint noisier. Each keys off the
+canonical grid/margin, so a `build_form` layout passes them clean. Deliberately
+conservative: `hierarchy` only fires on an explicit FontSize inversion (action
+text smaller than body), `spacing_consistency` needs ≥4 controls in a column.
+
+## Design directions for build_form (v0.7.46)
+
+The v0.7.45 themes (`light`/`polish`/`flat`) were invented by eye and looked
+soso. v0.7.46 adds three **curated design directions** that translate real
+design-system thinking into native Access. The only insertion point is
+`_resolve_theme`; `_plan_layout` changed ~2 lines (`pal = T.get("palette",
+D.PALETTE)`, title uses `T.get("title_font", font)`). `light`/`plain` stay
+literal, so the pure tests are untouched.
+
+### Pieces
+- **`design_defaults.py`** (additive): `type_scale(base, ratio)` (modular scale
+  → caption/body/subhead/title/display, whole points); `SPACE` (closed spacing
+  scale — the legacy `MARGIN_X`/`GAP_LABEL`/`COL_GAP`/… are now **aliases** into
+  it, same values, so old layouts/tests are byte-identical); `DENSITY`
+  (compact/comfortable/spacious — margins & gaps ONLY, never control sizes);
+  `DIRECTIONS` (the three bundles) + `DIRECTION_COMMON`. `PALETTE` is untouched
+  (a test pins it; `light` still uses it).
+- **The 3 directions** — `despacho` (Constantia serif title / Segoe UI body,
+  teal band, warm paper, comfortable, no card), `panel` (Segoe UI Semibold /
+  Segoe UI, slate band, white card on a cool canvas, comfortable), `archivo`
+  (Cambria serif / Corbel, clay band, warm paper, spacious, no card). Palette
+  keys are the canonical ones (`form_bg`/`field_bg`/`field_border`/`text`/
+  `accent`; `accent` doubles as the band). Colours are built with `bgr()`
+  **straight from the hex** so they can't drift — `test_directions_palette_anti_drift`
+  recomputes `bgr(hex)` and `test_directions_contrast_wcag` re-derives every
+  contrast with the lint's own WCAG maths.
+- **Two `info` lint rules** — `generic_font` (closed list: Arial/Roboto/Inter/
+  Times New Roman/MS Sans Serif) and a `type_hierarchy` extension of
+  `_rule_hierarchy` (header title must be larger than body). `_parse_geometry`
+  gained an additive `kind` per section (the `Begin` token) + `_assign_section_kind`
+  / `section_kind` on each control, so the header title is found reliably even
+  when a section exports without a `Name`.
+
+### The two-tone band fix (v0.7.46)
+The directions surfaced a latent v0.7.45 bug: `_set_section` resolved sections
+via `Form.Section(index)`, which **pywin32 cannot late-bind** (every index
+raises `-2147352573 "member not found"`). The call failed *silently* inside its
+own try/except, so the canvas colour was never painted onto Detail and the
+header/footer kept Access' oversized default heights — the themed light-blue
+header then showed past the form-width accent rectangle (the "two-tone band").
+Fix: `_get_section` resolves by the **named** property (`Detail`/`FormHeader`/
+`FormFooter`, which DO bind) with the index as fallback; and a styled header
+band is now painted on the section `BackColor` (which fills the full
+document-window width) via `plan["header_backcolor"]`, with the Rectangle kept
+as a fallback in case a theme overrides the section colour. Do NOT revert
+`_get_section` to the indexed accessor — it re-introduces the silent failure.
+
 ## Build-a-form-from-scratch recipes (v0.7.38)
 
 ### Add VBA to a form you just created with ac_create_form
@@ -256,6 +446,36 @@ ac_set_form_property(db, "form", "frmFoo", {"HasModule": True})
 ac_vbe_module_info(db, "form", "frmFoo")  # then this works too
 ```
 
+## VBE procedure editing (v0.7.42)
+
+Field-report fixes for `vbe.py`. Three behaviours to keep in mind:
+
+- **`ProcStartLine` owns the blank separator above a proc** (it equals the
+  previous proc's `End` + 1, so it includes the blank/comment lines VBE attributes
+  to the proc). `ac_vbe_replace_proc` therefore, *when replacing*, counts the run
+  of leading whitespace-only lines (`lead`) and deletes/inserts at `start + lead`
+  over `count - lead` — preserving the separator. A pure delete (`new_code==""`)
+  still deletes the whole `[start, count]` range (separator included) so a deleted
+  proc doesn't leave an orphan blank. Do NOT "simplify" this back to
+  `DeleteLines(start, count)` for the replace path — that re-introduces the
+  blank-eating bug Tom reported.
+- **The Option-placement health check is comment-header-aware**, not
+  line-number-thresholded. `_check_module_health` flags an `Option …` line only
+  when real code (non-blank, non-comment `'`/`Rem`, non-`Option`) already appeared
+  above it. A banner comment header of any length is fine. Do NOT restore the old
+  `i >= 5` threshold — it false-positived on long headers (e.g. `_modTest`).
+- **`new_lines` is an alias for `new_code` in `access_vbe_replace_lines`.** The
+  dispatcher (`_new_lines_to_code`) joins a list with `\n` (so `""` entries are
+  blank lines) and tolerates a JSON-encoded string from string-serialising
+  clients. A single-mode replace that deletes lines but inserts nothing appends a
+  note — the silent destructive-delete footgun (wrong arg name → empty `new_code`
+  → pure delete) is now surfaced, not hidden.
+
+`start_line` vs `body_line` (get_proc / module_info): `start_line` is the VBE proc
+start (includes the blank/comment lines above); `body_line` is the
+`Sub`/`Function`/`Property` declaration line. Use `start_line` for whole-proc ops,
+`body_line` for body line-range edits.
+
 ## Common Gotchas
 
 - VBE line numbers are **1-based**
@@ -277,6 +497,11 @@ ac_vbe_module_info(db, "form", "frmFoo")  # then this works too
 ### Linked tables and dbAttachSavePWD
 - `dbAttachSavePWD` = **131072** (0x20000), NOT 65536.
 - Setting `TableDef.Attributes` from Python COM before Append does not work reliably. Use `DoCmd.TransferDatabase(acLink, ..., StoreLogin:=True)` instead.
+- **`ac_list_linked_tables` filtering (v0.7.48)**: `name` (single exact/case-insensitive match), `names_only` (drop `connect_string` — a full dump of hundreds of links overflows the per-result token cap), `mask_password` (mask `PWD=` via `_mask_pwd`). All default to the pre-v0.7.48 full output so existing callers are unaffected.
+- **`ac_relink_table(refresh=True)` (v0.7.48)**: `_refresh_links` calls DAO `RefreshLink()` using the table's own connect string (no delete/TransferDatabase, password never touched) — for "the server schema changed, re-read it". `new_connect` is `Optional` and only required when `refresh=False`.
+
+### Scoped embedded lint (v0.7.48)
+`_attach_lint`/`lint_compact` take `focus_controls`: the design-mutation tools (`ac_create_control`, `ac_set_control_props`, `ac_set_multiple_controls`) pass the controls they just touched so `lint.violations` isn't buried by pre-existing issues on a big inherited form. `_violation_controls` matches a violation's own `control` **plus** an overlap pair's `measured.a`/`measured.b`. The `error`/`warning`/`info` counts stay whole-form (the model still sees there are other issues). `full_lint=true` bypasses the filter.
 
 ### ac_execute_sql / ac_execute_batch
 - Both use try/except retry with `dbSeeChanges` for ODBC linked tables with IDENTITY columns.

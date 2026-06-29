@@ -17,6 +17,7 @@ from .constants import (
     CTRL_TYPE_BY_NAME, SECTION_MAP,
 )
 from .helpers import coerce_prop, serialize_value, read_tmp, write_tmp
+from .design_defaults import snap as _snap_grid
 
 
 # ---------------------------------------------------------------------------
@@ -334,7 +335,8 @@ def _get_design_obj(app: Any, object_type: str, object_name: str) -> Any:
 def ac_create_control(
     db_path: str, object_type: str, object_name: str,
     control_type: Any, props: dict, class_name: Optional[str] = None,
-    control_name: Optional[str] = None,
+    control_name: Optional[str] = None, skip_lint: bool = False,
+    snap_to_grid: bool = False, full_lint: bool = False,
 ) -> dict:
     """
     Creates a new control in a form/report by opening it in Design view.
@@ -383,6 +385,14 @@ def ac_create_control(
     top         = int(coerce_prop(_pop_ci(props, "top",    -1)))
     width       = int(coerce_prop(_pop_ci(props, "width",  -1)))
     height      = int(coerce_prop(_pop_ci(props, "height", -1)))
+
+    # Opt-in: round positional dimensions to the design grid (60 twips). A
+    # value of -1 means "let Access decide" — leave those untouched.
+    if snap_to_grid:
+        left   = left   if left   < 0 else _snap_grid(left)
+        top    = top    if top    < 0 else _snap_grid(top)
+        width  = width  if width  < 0 else _snap_grid(width)
+        height = height if height < 0 else _snap_grid(height)
 
     # Top-level control_name → props['Name'] (only if not already explicit).
     if control_name and not any(k.lower() == "name" for k in props):
@@ -457,6 +467,37 @@ def ac_create_control(
         # Invalidate caches — form changed in Design view
         invalidate_object_caches(object_type, object_name)
 
+    return _attach_lint(result, db_path, object_type, object_name, skip_lint,
+                        focus_controls={result["name"]}, full_lint=full_lint)
+
+
+def _attach_lint(result: dict, db_path: str, object_type: str,
+                 object_name: str, skip_lint: bool,
+                 focus_controls: Optional[set] = None,
+                 full_lint: bool = False) -> dict:
+    """Attach a compact deterministic lint of the affected object to a design
+    mutation's result. Deterministic and unconditional (unless skip_lint) so a
+    broken layout surfaces on every edit — the LLM cannot wave it through.
+
+    By default the violations are scoped to the controls this mutation touched
+    (focus_controls), so pre-existing issues on unrelated controls of a big
+    inherited form don't bury the result; the error/warning/info counts stay
+    whole-form. full_lint=True keeps the unfiltered violations list.
+
+    Never raises: lint failures leave the mutation result untouched.
+    """
+    if skip_lint or object_type not in ("form", "report"):
+        return result
+    try:
+        from .lint import lint_compact
+        compact = lint_compact(
+            db_path, object_type, object_name,
+            focus_controls=None if full_lint else focus_controls,
+        )
+        if compact is not None:
+            result["lint"] = compact
+    except Exception:
+        pass
     return result
 
 
@@ -668,16 +709,30 @@ def ac_import_text(db_path: str, object_type: str, object_name: str,
 
 def ac_set_control_props(
     db_path: str, object_type: str, object_name: str,
-    control_name: str, props: dict
+    control_name: str, props: dict, skip_lint: bool = False,
+    snap_to_grid: bool = False, full_lint: bool = False,
 ) -> dict:
     """
     Modifies properties of an existing control by opening the form/report in Design view.
     props: dict {property: value}. Values are automatically converted
     to int/bool when appropriate.
+    With ``snap_to_grid``, any Left/Top/Width/Height in props is rounded to the
+    60-twip design grid before being applied.
     Returns {"applied": [...], "errors": {...}}.
     """
     if object_type not in ("form", "report"):
         raise ValueError("Only 'form' or 'report'")
+
+    if snap_to_grid:
+        props = dict(props)
+        for k in list(props):
+            if k.lower() in ("left", "top", "width", "height"):
+                try:
+                    v = int(coerce_prop(props[k]))
+                except (TypeError, ValueError):
+                    continue
+                if v >= 0:
+                    props[k] = _snap_grid(v)
 
     app = _Session.connect(db_path)
     _open_in_design(app, object_type, object_name)
@@ -697,7 +752,9 @@ def ac_set_control_props(
         # Invalidate caches — form changed in Design view
         invalidate_object_caches(object_type, object_name)
 
-    return {"applied": applied, "errors": errors}
+    return _attach_lint({"applied": applied, "errors": errors},
+                        db_path, object_type, object_name, skip_lint,
+                        focus_controls={control_name}, full_lint=full_lint)
 
 
 # ---------------------------------------------------------------------------
@@ -1004,7 +1061,8 @@ def ac_manage_tab_order(
 
 def ac_set_multiple_controls(
     db_path: str, object_type: str, object_name: str,
-    controls: list[dict],
+    controls: list[dict], skip_lint: bool = False,
+    full_lint: bool = False,
 ) -> dict:
     """
     Modifies properties of multiple controls in a single operation.
@@ -1045,4 +1103,7 @@ def ac_set_multiple_controls(
         _save_and_close(app, object_type, object_name)
         invalidate_object_caches(object_type, object_name)
 
-    return {"results": results}
+    focus = {c.get("name") for c in controls if c.get("name")}
+    return _attach_lint({"results": results},
+                        db_path, object_type, object_name, skip_lint,
+                        focus_controls=focus, full_lint=full_lint)

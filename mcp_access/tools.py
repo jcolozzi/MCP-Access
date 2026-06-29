@@ -1,5 +1,5 @@
 """
-MCP Tool definitions (65 tools) and schema utilities.
+MCP Tool definitions (67 tools) and schema utilities.
 """
 
 import mcp.types as types
@@ -139,7 +139,13 @@ TOOLS = [
     ),
     types.Tool(
         name="access_vbe_get_proc",
-        description="Code of a VBA procedure by name. Returns start_line, body_line, count, code.",
+        description=(
+            "Code of a VBA procedure by name. Returns start_line, body_line, count, code. "
+            "start_line = VBE proc start, which INCLUDES the blank separator / comment "
+            "lines above the proc (use it for whole-proc operations). "
+            "body_line = the Sub/Function/Property declaration line itself (use it for "
+            "line-range edits of the body)."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
@@ -153,7 +159,11 @@ TOOLS = [
     ),
     types.Tool(
         name="access_vbe_module_info",
-        description="Index of procedures in a VBA module: total_lines, procs [{name, start_line, body_line, count}].",
+        description=(
+            "Index of procedures in a VBA module: total_lines, procs [{name, start_line, "
+            "body_line, count}]. start_line = VBE proc start (INCLUDES preceding blank/"
+            "comment lines); body_line = the Sub/Function/Property declaration line."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
@@ -169,7 +179,9 @@ TOOLS = [
         description=(
             "Replaces lines in a VBA module via VBE. "
             "count=0: insertion. new_code='': deletion. Validates bounds automatically. "
-            "Batch mode: pass 'operations' (list of {start_line, count, new_code}) "
+            "Pass new code as new_code (a string) OR new_lines (a list of strings, "
+            "joined with newlines — '' entries become blank lines). "
+            "Batch mode: pass 'operations' (list of {start_line, count, new_code|new_lines}) "
             "to execute multiple operations in 1 call (auto-sorted bottom-to-top)."
         ),
         inputSchema={
@@ -181,15 +193,18 @@ TOOLS = [
                 "start_line":  {"type": "integer", "description": "First line (1-based). Ignored if operations present."},
                 "count":       {"type": "integer", "description": "Lines to delete (0 = insert). Ignored if operations present."},
                 "new_code":    {"type": "string",  "description": "New code ('' = delete). Ignored if operations present."},
+                "new_lines":   {"type": "array", "items": {"type": "string"},
+                                "description": "Alias for new_code as a list of lines (joined with '\\n'; '' = blank line). Ignored if operations present."},
                 "operations":  {
                     "type": "array",
-                    "description": "Batch mode: list of operations. Each: {start_line, count, new_code}. Auto-sorted bottom-to-top.",
+                    "description": "Batch mode: list of operations. Each: {start_line, count, new_code|new_lines}. Auto-sorted bottom-to-top.",
                     "items": {
                         "type": "object",
                         "properties": {
                             "start_line": {"type": "integer"},
                             "count": {"type": "integer"},
                             "new_code": {"type": "string"},
+                            "new_lines": {"type": "array", "items": {"type": "string"}},
                         },
                         "required": ["start_line", "count"],
                     },
@@ -258,7 +273,12 @@ TOOLS = [
     ),
     types.Tool(
         name="access_vbe_replace_proc",
-        description="Replaces an entire VBA procedure by name. new_code='' deletes it.",
+        description=(
+            "Replaces an entire VBA procedure by name (boundaries found via VBE). "
+            "Preserves the blank separator line above the proc. "
+            "new_code='' DELETES the proc (and its leading blank separator) — this is "
+            "the supported way to delete a procedure."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
@@ -377,6 +397,14 @@ TOOLS = [
                     "type": "string",
                     "description": "ProgID for ActiveX (type 119). E.g.: 'Shell.Explorer.2', 'MSCAL.Calendar.7'. Initializes the OLE control.",
                 },
+                "skip_lint": {
+                    "type": "boolean",
+                    "description": "Suppress the embedded UI lint of the affected object (default false). Only for bulk programmatic edits.",
+                },
+                "snap_to_grid": {
+                    "type": "boolean",
+                    "description": "Round left/top/width/height to the 60-twip design grid (default false). Values of -1 (auto) are left untouched.",
+                },
             },
             "required": ["db_path", "object_type", "object_name", "control_type", "props"],
         },
@@ -437,6 +465,14 @@ TOOLS = [
                     "type": "object",
                     "description": "Properties to modify: {Caption: 'X', Left: 1000, Visible: true, ...}",
                     "additionalProperties": True,
+                },
+                "skip_lint": {
+                    "type": "boolean",
+                    "description": "Suppress the embedded UI lint of the affected object (default false). Only for bulk programmatic edits.",
+                },
+                "snap_to_grid": {
+                    "type": "boolean",
+                    "description": "Round any Left/Top/Width/Height in props to the 60-twip design grid (default false).",
                 },
             },
             "required": ["db_path", "object_type", "object_name", "control_name", "props"],
@@ -871,6 +907,68 @@ TOOLS = [
             "required": ["db_path", "form_name"],
         },
     ),
+    # -- Build form (auto-layout) -------------------------------------------
+    types.Tool(
+        name="access_build_form",
+        description=(
+            "Builds a complete, well-laid-out form from a DECLARATIVE spec — the "
+            "preferred way to create data-entry forms. You describe WHAT goes on the "
+            "form (a title, an ordered list of fields, a row of action buttons, "
+            "single or two-column); the tool computes every Left/Top/Width/Height from "
+            "a canonical 60-twip grid, applies a WCAG-safe palette (or a curated "
+            "design direction via theme=despacho|panel|archivo), assigns a sane tab "
+            "order and sizes the form and its header/footer sections. You never pick a "
+            "coordinate. Use this instead of many access_create_control calls; fine-tune "
+            "afterwards with access_set_control_props if needed. See access_tips('layout') "
+            "for the numbers and access_tips('design') for the directions."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Path to .accdb/.mdb file"},
+                "form_name": {"type": "string", "description": "Name of the form to create"},
+                "record_source": {"type": "string", "description": "Optional table/query to bind the form to. Fields with a matching name get a ControlSource."},
+                "title": {"type": "string", "description": "Optional. Adds a form-header band with this caption (bold dark title, readable on the themed header) and sets the form Caption."},
+                "fields": {
+                    "type": "array",
+                    "description": "Ordered fields. Each item is a string (bound textbox) OR an object: {field, label, control(textbox|memo|combobox|listbox|checkbox|date), name, control_source, row_source, width_units (single-column only), height, props}.",
+                    "items": {"type": ["string", "object"], "additionalProperties": True},
+                },
+                "actions": {
+                    "type": "array",
+                    "description": "Footer buttons. Each item is a string (caption) OR an object {caption, name, on_click, props}.",
+                    "items": {"type": ["string", "object"], "additionalProperties": True},
+                },
+                "layout": {
+                    "type": "string",
+                    "enum": ["single", "two-column"],
+                    "default": "single",
+                    "description": "single = one label+field per row; two-column = two pairs per row (width_units ignored).",
+                },
+                "default_view": {"type": "integer", "description": "Optional initial view: 0=Single, 1=Continuous, 2=Datasheet, ..."},
+                "theme": {
+                    "type": "string",
+                    "enum": ["light", "plain", "polish", "flat",
+                             "despacho", "panel", "archivo"],
+                    "default": "light",
+                    "description": (
+                        "Visual style. Basics: light = palette+fonts on the default "
+                        "look; plain = geometry only; polish = Segoe UI + more air + "
+                        "chrome off; flat = accent band + card + grey canvas. "
+                        "Curated DESIGN DIRECTIONS (coherent typeface + type scale + "
+                        "WCAG-verified palette + density, all with an accent header "
+                        "band): despacho (serif Constantia title on warm paper), "
+                        "panel (Segoe UI Semibold, white card on a cool canvas), "
+                        "archivo (serif Cambria title, warm editorial, spacious). "
+                        "See access_tips('design') for the full guide."
+                    ),
+                },
+                "overwrite": {"type": "boolean", "default": False, "description": "Delete an existing form of the same name first."},
+                "skip_lint": {"type": "boolean", "description": "Suppress the embedded UI lint of the result (default false)."},
+            },
+            "required": ["db_path", "form_name"],
+        },
+    ),
     # -- Delete object -------------------------------------------------------
     types.Tool(
         name="access_delete_object",
@@ -919,6 +1017,10 @@ TOOLS = [
                 "expression": {
                     "type": "string",
                     "description": "Expression to evaluate (e.g.: 'Forms!frmX.MARGEN_SEG', 'Date()', 'DLookup(\"Empresa\",\"Ventas\",\"numc=1\")')",
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Timeout in seconds. If the expression (or its temp-module fallback) blocks on a MsgBox/InputBox or other modal dialog, it is auto-dismissed and an error is returned -- same behaviour as access_run_vba",
                 },
             },
             "required": ["db_path", "expression"],
@@ -1036,7 +1138,7 @@ TOOLS = [
         name="access_execute_batch",
         description=(
             "Executes multiple SQL statements in a single call. "
-            "Each statement can be SELECT (returns rows, limit 100) or "
+            "Each statement can be SELECT (returns rows, default limit 100 — adjustable via 'limit') or "
             "INSERT/UPDATE/DELETE (returns affected_rows). "
             "stop_on_error=true stops at first error. "
             "DELETE/DROP/TRUNCATE/ALTER require confirm_destructive=true."
@@ -1065,6 +1167,11 @@ TOOLS = [
                 "confirm_destructive": {
                     "type": "boolean", "default": False,
                     "description": "Required for DELETE/DROP/TRUNCATE/ALTER",
+                },
+                "limit": {
+                    "type": "integer", "default": 100,
+                    "description": "Max rows returned per SELECT statement "
+                                   "(1-10000, default 100)",
                 },
             },
             "required": ["db_path", "statements"],
@@ -1122,14 +1229,60 @@ TOOLS = [
                         "required": ["name", "props"],
                     },
                 },
+                "skip_lint": {
+                    "type": "boolean",
+                    "description": "Suppress the embedded UI lint of the affected object (default false). Only for bulk programmatic edits.",
+                },
             },
             "required": ["db_path", "object_type", "object_name", "controls"],
+        },
+    ),
+    types.Tool(
+        name="access_lint_form",
+        description=(
+            "NOT a designer and NOT aesthetics — expect zero 'good design' from this. "
+            "It is a deterministic checker of the OBVIOUS, mechanically-verifiable "
+            "stuff only (a seatbelt, not a stylist). Returns structured "
+            "JSON violations the agent should fix BEFORE declaring a layout done: "
+            "contrast (WCAG white-on-white etc.), overlap, out-of-bounds, text "
+            "truncation, sibling inconsistency, misalignment, zero-size/invisible. "
+            "summary.verdict is PASS / REVIEW / FAIL. Static (one export, no Design "
+            "view). measure='auto' tries Access WizHook for exact text width and "
+            "falls back to a heuristic. The same engine runs automatically on every "
+            "control mutation (see the 'lint' block in those tools' results)."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "db_path": {"type": "string", "description": "Path to .accdb/.mdb file"},
+                "object_type": {"type": "string", "enum": ["form", "report"], "default": "form"},
+                "object_name": {"type": "string", "description": "Form/report name"},
+                "rules": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Subset of rule ids to run; omit for all. Ids: contrast, overlap, out_of_bounds, truncation, sibling_inconsistency, misalignment, invisible_or_zero_size, grid_alignment, spacing_consistency, edge_margin, hierarchy, generic_font (the last 5 are info-only design-quality checks).",
+                },
+                "measure": {
+                    "type": "string",
+                    "enum": ["auto", "wizhook", "heuristic"],
+                    "description": "Text-width source for truncation. 'wizhook' = exact (needs compiled VBA); 'heuristic' = no COM; 'auto' tries wizhook then falls back. Default 'auto'.",
+                },
+                "include_screenshot": {
+                    "type": "boolean",
+                    "description": "Also capture a PNG of the form and return its path (default false).",
+                },
+                "max_violations": {
+                    "type": "integer",
+                    "description": "Cap on returned violations (default 200; info dropped first, errors kept).",
+                },
+            },
+            "required": ["db_path", "object_name"],
         },
     ),
     # -- Tips / knowledge base -----------------------------------------------
     types.Tool(
         name="access_tips",
-        description="Tips and gotchas for working with Access via MCP. Topics: eval, controls, gotchas, sql, vbe, compile, design. Without topic returns the list.",
+        description="Tips and gotchas for working with Access via MCP. Topics: eval, controls, gotchas, sql, vbe, compile, design, lint, macros, subform_tabcontrol. Without topic returns the list.",
         inputSchema={
             "type": "object",
             "properties": {

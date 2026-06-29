@@ -140,9 +140,22 @@ class _Session:
     _app: Optional[Any] = None
     _db_open: Optional[str] = None
     _pid: Optional[int] = None  # captured in _launch() on the COM worker thread (atexit can't query COM)
+    _wd_thread: Optional[Any] = None  # global dialog watchdog thread
+    _wd_stop: Optional[Any] = None    # threading.Event to stop the watchdog
     _cm_cache: dict = {}   # "type:name" -> CodeModule COM object
     _decompiled_dbs: set = set()  # DBs already decompiled in this session
     _attached: bool = False  # True if we attached via GetActiveObject; False if we spawned via DispatchEx
+    # time.monotonic() when a tool call entered the COM executor; None when
+    # idle.  Set/cleared by server.call_tool around run_in_executor.  Lets the
+    # global dialog watchdog distinguish a modal raised by OUR blocked COM
+    # call (dismiss it) from one the interactive user is looking at (leave it)
+    # on attached instances.  Plain attribute read/write — atomic under GIL.
+    _tool_started: Optional[float] = None
+    # (time.monotonic(), dialog_title) of the last dialog auto-dismissed by
+    # any watchdog (all funnel through _dismiss_dialogs_by_pid).  server.call_tool
+    # compares the timestamp against the call's start to append a diagnostic
+    # note ("a modal dialog was auto-dismissed during this call") to the result.
+    _last_dismissed: Optional[tuple] = None
     # Detected Office install. Defaults are the hardcoded fallback used pre-0.7.36.
     # _detect_office_install() runs once per process and updates these in place.
     _office_version: str = "16.0"
@@ -159,6 +172,27 @@ class _Session:
             except Exception:
                 log.warning("COM session stale — auto-reconnecting...")
                 cls._force_cleanup()
+            else:
+                # The app proxy can be alive while the database has been
+                # closed under us (e.g. by its own startup code, or by the
+                # user in an attached instance).  A stale _db_open wedges
+                # every later CurrentDb/CurrentData call with "object is
+                # closed or doesn't exist" — and on attached instances
+                # reconnects re-attach to the same broken instance forever.
+                # CurrentDb() costs one extra COM round-trip per tool call;
+                # acceptable (~ms) for the recovery it buys.
+                if cls._db_open is not None:
+                    db_alive = False
+                    try:
+                        db_alive = cls._app.CurrentDb() is not None
+                    except Exception:
+                        pass
+                    if not db_alive:
+                        log.warning(
+                            "Database closed under the session (%s) — "
+                            "auto-reconnecting...", cls._db_open,
+                        )
+                        cls._force_cleanup()
         if cls._app is None:
             cls._launch()
         if cls._db_open != resolved:
@@ -168,6 +202,7 @@ class _Session:
     @classmethod
     def _force_cleanup(cls):
         """Reset state without calling methods on a dead COM object."""
+        cls._stop_dialog_watchdog()
         _release_shift()
         cls._app = None
         cls._db_open = None
@@ -176,6 +211,95 @@ class _Session:
         cls._cm_cache.clear()
         cls._decompiled_dbs.clear()
         _parsed_controls_cache.clear()
+
+    # -----------------------------------------------------------------------
+    # Global dialog watchdog
+    # -----------------------------------------------------------------------
+    @classmethod
+    def _start_dialog_watchdog(cls) -> None:
+        """Start a background thread that dismisses Access-owned modal dialogs
+        which persist past a grace period.
+
+        This backstops operations that have NO watchdog of their own — most
+        importantly VBE code-module access (get_proc / find_definition /
+        module_info ...).  Without it, a blocking modal raised during the
+        startup form of a DB such as
+            'Error accessing file. Network connection may have been lost.'
+        hangs the COM call indefinitely (observed: a 1-hour hang on a DB
+        with a startup form).  Operation-specific watchdogs (open / compile /
+        run_vba) react faster and screenshot first; the grace period keeps
+        this thread from stealing their dialog.
+
+        On spawned instances every persistent dialog is ours to dismiss.
+        On ATTACHED instances (user's own Access) we only dismiss while one
+        of OUR tool calls is in flight (_tool_started) — a modal raised then
+        was almost certainly provoked by that blocked COM call (e.g. a VBA
+        project that fails to load popping 'Error accessing file. Network
+        connection may have been lost.'), and without dismissal the tool
+        call hangs until a human clicks.  A dialog with no tool call in
+        flight belongs to the interactive user and is never touched."""
+        pid = cls._pid
+        if not pid:
+            return
+        # Always (re)start fresh so the watchdog tracks the CURRENT pid.
+        cls._stop_dialog_watchdog()
+        stop = threading.Event()
+        cls._wd_stop = stop
+
+        def _loop():
+            from .vba_exec import _find_dialog_hwnds_by_pid, _dismiss_dialogs_by_pid
+            GRACE = 3.0            # s a dialog must persist before we force-dismiss
+            GRACE_ATTACHED = 5.0   # more conservative on the user's own Access
+            POLL = 0.5
+            seen: dict = {}   # hwnd -> monotonic first-seen
+            while not stop.wait(POLL):
+                try:
+                    hwnds = _find_dialog_hwnds_by_pid(pid)
+                except Exception:
+                    continue
+                now = time.monotonic()
+                for h in list(seen):
+                    if h not in hwnds:
+                        del seen[h]
+                for h in hwnds:
+                    seen.setdefault(h, now)
+                attached = cls._attached
+                grace = GRACE_ATTACHED if attached else GRACE
+                if attached:
+                    # Only act while one of our tool calls has been blocked
+                    # at least as long as the grace period.
+                    started = cls._tool_started
+                    if started is None or now - started < grace:
+                        continue
+                stale = [h for h in hwnds if now - seen.get(h, now) >= grace]
+                if stale:
+                    log.warning(
+                        "Global dialog watchdog: %d dialog(s) persisted >%.0fs "
+                        "(pid=%s, attached=%s) -- dismissing",
+                        len(stale), grace, pid, attached,
+                    )
+                    try:
+                        _dismiss_dialogs_by_pid(pid)
+                    except Exception as e:
+                        log.warning("Global watchdog dismiss error: %s", e)
+                    seen.clear()  # re-grace any survivors before re-hitting
+
+        t = threading.Thread(target=_loop, name="mcp-access-global-dialog-wd",
+                             daemon=True)
+        cls._wd_thread = t
+        t.start()
+        log.info("Global dialog watchdog started (pid=%s, attached=%s)",
+                 pid, cls._attached)
+
+    @classmethod
+    def _stop_dialog_watchdog(cls) -> None:
+        try:
+            if cls._wd_stop is not None:
+                cls._wd_stop.set()
+        except Exception:
+            pass
+        cls._wd_thread = None
+        cls._wd_stop = None
 
     @classmethod
     def _launch(cls) -> None:
@@ -229,6 +353,11 @@ class _Session:
         # match the real install. Never raises; logs a warning and keeps
         # defaults if nothing matched.
         cls._detect_office_install()
+        # Global background dialog watchdog — backstops operations without
+        # their own watchdog (VBE access) so a blocking modal like
+        # "Error accessing file. Network connection may have been lost."
+        # can't hang a COM call forever.
+        cls._start_dialog_watchdog()
 
     @classmethod
     def reopen(cls, path: str) -> None:
@@ -629,6 +758,43 @@ class _Session:
             log.warning("A blocking dialog was auto-dismissed. Screenshot: %s",
                         _dialog_screenshots[0])
 
+        # Post-open validation: confirm the database actually stayed open.
+        # Startup code can close the database during an automated open — e.g.
+        # an AutoExec/startup-form error path firing because backend links are
+        # broken, with AllowBypassKey=False defeating the SHIFT bypass (the
+        # watchdog's Cancel click then routes through the form's error
+        # handler, which closes the db).  Without this check, _db_open would
+        # record a database that isn't there, and every later call would die
+        # at CurrentDb/CurrentData with "object is closed or doesn't exist",
+        # wedging the session permanently.  Also covers the case where the
+        # "already have the database open" swallow above masked a dead db.
+        db_alive = False
+        try:
+            db_alive = cls._app.CurrentDb() is not None
+        except Exception as e_val:
+            log.warning("Post-open validation raised: %s", e_val)
+        if not db_alive:
+            log.error(
+                "Database closed itself during open: %s — resetting session",
+                path,
+            )
+            # quit() does the right thing for both cases: spawned instances
+            # are quit (taskkill fallback included); attached instances are
+            # released without touching the user's Access.
+            try:
+                cls.quit()
+            except Exception as e_q:
+                log.warning("Session teardown after failed open: %s", e_q)
+                cls._force_cleanup()
+            raise RuntimeError(
+                f"Database closed itself while opening: {path}. Its startup "
+                "code (AutoExec / startup form) most likely failed and closed "
+                "the database — common causes: missing backend table links, "
+                "or AllowBypassKey=False defeating the SHIFT bypass. The COM "
+                "session has been reset; open the file manually in Access "
+                "while holding SHIFT to investigate."
+            )
+
         cls._db_open = path
 
         # Close any auto-opened forms (safety net)
@@ -650,6 +816,7 @@ class _Session:
 
     @classmethod
     def quit(cls) -> None:
+        cls._stop_dialog_watchdog()
         if cls._app is not None:
             if cls._attached:
                 log.info("Releasing attached Access.Application (not quitting user's session)")

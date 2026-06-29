@@ -4,6 +4,7 @@ MCP Server setup: list_tools, list_prompts, get_prompt, call_tool, main.
 
 import asyncio
 import json
+import time
 import traceback
 
 import mcp.types as types
@@ -98,7 +99,26 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
     log.info(">>> %s  %s", name, safe_args)
 
     loop = asyncio.get_running_loop()
-    text = await loop.run_in_executor(_com_executor, call_tool_sync, name, arguments)
+    # Mark a tool call as in flight so the global dialog watchdog knows a
+    # persistent modal on an ATTACHED Access instance was provoked by our
+    # (now blocked) COM call and may be dismissed.  Cleared in finally so an
+    # idle session never auto-dismisses the interactive user's dialogs.
+    started = time.monotonic()
+    _Session._tool_started = started
+    try:
+        text = await loop.run_in_executor(_com_executor, call_tool_sync, name, arguments)
+    finally:
+        _Session._tool_started = None
+    # A watchdog dismissed a modal while this call was in flight: surface it.
+    # A silently dismissed dialog (e.g. a save-changes prompt cancelled by the
+    # Cancel-first policy) can make an otherwise clean result wrong (#31).
+    d = _Session._last_dismissed
+    if d and d[0] >= started:
+        text += (
+            f"\n\n[mcp-access] Note: a modal dialog ({d[1]!r}) was "
+            "auto-dismissed by the dialog watchdog during this call. "
+            "If the result looks wrong, the dialog is the likely cause."
+        )
     return [types.TextContent(type="text", text=text)]
 
 

@@ -26,6 +26,7 @@ The AI handles the COM automation, design view, VBA modules, binary sections, ca
 - **Relationships, indexes, references, queries, macros** — full CRUD. Clone any object (form / report / module / class / query / macro) preserving VBA and binary sections
 - **Maintenance** — compact & repair, decompile bloated databases, export structure docs. Office install autodetected (no more hardcoded Office 16 paths)
 - **Dependency graph** — build a vis.js interactive graph of every object and its connections (relationships, RecordSource, ControlSource, SourceObject, RowSource, VBA heuristics, macro actions). Opens in a browser
+- **UI lint** — `access_lint_form` flags *objectively* broken layouts (white-on-white text, overlaps, truncation, off-canvas controls). A checker, **not** a designer — see the note below
 
 Works with Claude Code, Cursor, Windsurf, Continue, or any MCP-compatible client.
 
@@ -85,7 +86,7 @@ Add to your MCP config file (`.mcp.json`, `mcp.json`, or client-specific setting
 
 Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 
-## Tools (67)
+## Tools (69)
 
 ### Database
 
@@ -140,6 +141,15 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 | `access_delete_control` | Delete a control via COM |
 | `access_set_control_props` | Modify control properties via COM in design view |
 | `access_set_multiple_controls` | Modify properties of multiple controls in a single design-view session |
+| `access_lint_form` | Deterministic check for objectively-broken layout: contrast (WCAG), overlap, out-of-bounds, truncation, sibling inconsistency, zero-size/invisible. Returns `verdict` PASS/REVIEW/FAIL. Also runs automatically on every control edit |
+
+> ### ⚠️ A note on `access_lint_form` — manage your expectations
+>
+> **This is NOT a designer and there is zero super-design here.** Don't expect it to make a form *look good*, suggest a nice palette, or have any taste — it has none and never will.
+>
+> It is a **dumb, deterministic verifier of the obvious, easy-to-check stuff**: is the text the same colour as its background? do two controls physically overlap? does a caption not fit its box? is something off the edge of the form, or zero pixels tall? That's it. Plain math — WCAG contrast ratios and rectangle intersection — with a pile of false-positive guards so it doesn't cry wolf.
+>
+> Think **seatbelt, not stylist**: it won't make the car pretty, it just stops you shipping a form with white text on a white background without noticing. It runs automatically on every control edit so those obvious mistakes surface on their own. If you were hoping for a UI-design AI, this isn't it (honest PRs to make it smarter are very welcome 😄).
 
 ### Text export/import
 
@@ -161,8 +171,8 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 
 | Tool | Description |
 |------|-------------|
-| `access_list_linked_tables` | List all linked tables with source table, connection string, ODBC flag |
-| `access_relink_table` | Change connection string and refresh link — auto-saves credentials (`dbAttachSavePWD`) when UID/PWD detected. `relink_all=true` updates all tables with the same original connection |
+| `access_list_linked_tables` | List linked tables with source table, connection string, ODBC flag. `name='X'` returns one table; `names_only=true` is a light listing (no connect strings — use it when hundreds of links overflow the result); `mask_password=true` masks `PWD=` |
+| `access_relink_table` | Change connection string and refresh link — auto-saves credentials (`dbAttachSavePWD`) when UID/PWD detected. `relink_all=true` updates all tables with the same original connection. `refresh=true` re-reads the schema using the table's own connect string (no `new_connect`, password never dumped) |
 
 ### Relationships
 
@@ -329,9 +339,169 @@ The MCP Python SDK (v1.26.0) has a catch-all `except Exception` in `mcp/shared/s
 
 ## Changelog
 
-### v0.7.39 — 2026-05-28
+### v0.7.49 — 2026-06-25
 
-**New tool** — `access_graph_query`: query the dependency graph without re-scanning. **66 → 67 tools.**
+Bugfix reported by [@TvanStiphout-Home](https://github.com/TvanStiphout-Home) (Tom van Stiphout) — **thank you Tom**, once again, for the laser-precise diagnosis and repro steps. We owe you a beer (or ten).
+
+- **VBE-write tools no longer pop an Access error dialog** (`issue #33`).
+  `access_vbe_replace_lines`, `access_vbe_replace_proc`, `access_vbe_patch_proc`
+  and `access_vbe_append` all call `DoCmd.Save` to persist VBE changes to the
+  `.accdb`. When the target module or form was open in the VBE, Access popped a
+  modal "Save isn't available now" error dialog and waited for a click — one
+  dialog per write call, completely blocking the UI. The `except Exception: pass`
+  swallowed the COM error so edits landed fine, but the watchdog that covers
+  compile/eval paths was absent on the write path so nothing dismissed the dialog.
+  Fix: the four `DoCmd.Save` calls are now wrapped in a new `_save_vbe_module`
+  helper that spins up a daemon watchdog thread (0.3 s grace period, same pattern
+  as `_call_with_dialog_watchdog` in `maintenance.py`) to dismiss the dialog
+  automatically. No behaviour change: the save remains best-effort and the edit
+  always lands regardless.
+
+### v0.7.48 — 2026-06-24
+
+Usability fixes from a real editing session against a database with many
+ODBC-linked tables. No behaviour change for existing callers (still **67 tools**).
+
+- **`access_list_linked_tables` no longer overflows on large databases.** With
+  hundreds of linked tables the tool used to dump every full connect string,
+  blowing past the per-result token cap and forcing a `grep`. New optional args:
+  `name='X'` (return just that table, exact + case-insensitive), `names_only=true`
+  (light listing, no connect strings), and `mask_password=true` (mask `PWD=` in
+  the returned connect strings). Defaults preserve the previous output.
+- **`access_relink_table refresh=true`.** Re-reads a linked table's schema using
+  its **own** current connect string (no `new_connect` needed, password never
+  dumped) — the common "I altered the table on the server, refresh the link"
+  case. `relink_all=true` refreshes every table sharing the connect string.
+- **Scoped embedded lint.** Creating/editing a control on a big inherited form
+  used to attach the whole-form lint (pre-existing warnings on unrelated
+  controls drowned out the change). `access_create_control`,
+  `access_set_control_props` and `access_set_multiple_controls` now scope the
+  `lint.violations` list to the controls they touched (the error/warning/info
+  counts stay whole-form); pass `full_lint=true` for the unfiltered list.
+- **Docs:** the `access_relink_table` description now notes that `LoginTimeout=8`
+  is injected into `new_connect`, so the returned connect string differs from the
+  one you sent.
+
+### v0.7.47 — 2026-06-22
+
+Bugfix reported by [@jbchea](https://github.com/jbchea)
+([#32](https://github.com/unmateria/MCP-Access/issues/32)) — thanks!
+
+- **Fix: duplicate `"design"` key in `tips.py`.** The v0.7.45/46 design-system
+  work added a second `"design"` entry to the `_TIPS` dict, silently shadowing
+  the original one. Python keeps only the last assignment, so
+  `access_tips('design')` returned only the new design-direction guidance and the
+  earlier tip (Design view ↔ VBE close-ordering + SaveAsText per-object-type
+  encoding) was unreachable dead code. The original tip now lives under its own
+  key, `access_tips('design_vbe')`, so both are reachable again. No behaviour
+  change beyond the tips topic (still **67 tools**).
+
+### v0.7.46 — 2026-06-19
+
+Real design taste for `access_build_form` — three curated **design directions**
+replace the ad-hoc themes (still **67 tools**).
+
+- **New: three design directions** (`theme=despacho|panel|archivo`) — each a
+  coherent bundle of a typeface with character, a modular type scale, a
+  dominant+accent palette with **WCAG-verified contrast**, a spacing density and
+  an accent header band. `despacho` (serif on warm paper, teal), `panel`
+  (semibold sans, white card on a cool canvas, slate), `archivo` (serif, warm
+  editorial, spacious, clay). Each builds lint-clean.
+- **New: design tokens** (`type_scale`, `SPACE`, `DENSITY`, `DIRECTIONS`) and a
+  design guide at `access_tips('design')` — including the honest ceiling (native
+  Access has no gradients, shadows, rounded corners, blur or animation).
+- **Lint:** two new `info`-only rules — `generic_font` (Arial/Roboto/Inter/…) and
+  a header-title check folded into `hierarchy`. Never change the verdict.
+- **Fix: two-tone header band.** `_set_section` resolved sections via the
+  indexed `Form.Section(i)`, which pywin32 can't late-bind, so it failed
+  silently — the canvas was never painted and the header kept Access' themed
+  default, bleeding past the accent rectangle. Sections are now resolved by
+  their named properties and the band fills the full width.
+
+### v0.7.45 — 2026-06-19
+
+Better-looking forms by construction — the layout arithmetic moves from the LLM
+into the MCP (no skill, no hooks). One new tool (**67 total**).
+
+- **New: `access_build_form`** — declarative auto-layout. Describe the form
+  (title, ordered fields, action buttons, single/two-column) and it computes
+  every coordinate from a canonical 60-twip grid, applies a closed WCAG-safe
+  palette, assigns a tab order and sizes the form + header/footer. The model
+  never picks a coordinate.
+- **New: design tokens** (`mcp_access/design_defaults.py`) — single source of
+  truth for grid, sizes, spacing, fonts and the BGR palette. Documented for
+  hand-placement in `access_tips('layout')`.
+- **New: `snap_to_grid`** (opt-in) on `access_create_control` /
+  `access_set_control_props` — rounds Left/Top/Width/Height to the 60-twip grid.
+- **Lint:** four new `info`-only layout-quality rules — `grid_alignment`,
+  `spacing_consistency`, `edge_margin`, `hierarchy`. They enrich the full
+  `access_lint_form` report without changing the verdict or the embedded
+  mutation lint.
+
+### v0.7.44 — 2026-06-12
+
+Follow-ups to the attached-mode dialog hangs reported by
+[@CaptainStormfield](https://github.com/CaptainStormfield)
+([#31](https://github.com/unmateria/MCP-Access/issues/31)).
+
+- **Fix:** `access_eval_vba` gains an optional `timeout` parameter — same
+  dialog-watchdog treatment as `access_run_vba`, covering both
+  `Application.Eval` and the temp-module fallback.
+- **Fix:** stale `_mcp_eval_wrapper` temp modules (left behind when a modal
+  blocked their cleanup) no longer wedge the session — they are swept before
+  the next eval fallback.
+- **Fix:** `access_delete_object` saves dirty VBA modules best-effort before
+  deleting, preventing the *"save changes to the design of module X?"* prompt.
+- **DX:** any dialog auto-dismissed by a watchdog during a tool call is now
+  named in the tool result, instead of being dismissed silently.
+
+### v0.7.43 — 2026-06-11
+
+Wedged-session detection — thanks to
+[@CaptainStormfield](https://github.com/CaptainStormfield)
+([#30](https://github.com/unmateria/MCP-Access/pull/30)) — plus a usability
+bughunt round.
+
+- **Fix:** a database whose startup code closes it during the open no longer
+  wedges the COM session permanently. The open is validated (`CurrentDb()`),
+  the session resets itself, and every tool call health-checks that the db is
+  still open (auto-reconnect if not). Based on PR #30 by @CaptainStormfield.
+- **Fix:** the global dialog watchdog now also protects ATTACHED Access
+  instances — a modal raised by one of our blocked COM calls (e.g. a VBA
+  project that fails to load) is dismissed after a 5 s grace, instead of
+  hanging the tool call until a human clicks. Idle dialogs of the interactive
+  user are never touched.
+- **Fix:** `access_vbe_search_all` / `access_find_usages` /
+  `access_find_definition` report `objects_skipped` + `errors` instead of a
+  false "0 matches" when modules are inaccessible.
+- **Fix:** `access_list_references` survives broken references (per-property
+  fallback to `null`, `is_broken` flag, `broken_count`).
+- **DX:** clearer errors for omitted `start_line` (`access_vbe_replace_lines`),
+  VBA-only code on a non-existent form (`access_set_code`), and empty modules
+  (`access_vbe_get_lines`); batch replace warns on destructive no-op deletes;
+  `access_execute_batch` gained a `limit` parameter.
+
+### v0.7.42 — 2026-06-06
+
+VBE procedure-editing fixes from field reports.
+
+- **Fix:** `access_vbe_replace_proc` no longer deletes the blank separator line
+  above a procedure — it preserves leading blank line(s) on replace (a pure
+  `new_code=''` delete still removes the proc and its leading blank).
+- **Fix:** modules with a long comment/banner header no longer trigger a
+  spurious *"Option … expected in first 5 lines"* warning. The check now flags an
+  Option statement only when real code precedes it.
+- **DX:** `access_vbe_replace_lines` accepts `new_lines` (a list of lines) as an
+  alias for `new_code`, and now warns when a replace deletes lines but inserts
+  nothing — so a misnamed argument can no longer cause a silent destructive
+  delete.
+- `access_vbe_get_proc` / `access_vbe_module_info` docs clarify `start_line`
+  (includes the blank/comment lines above the proc) vs `body_line` (the
+  declaration line).
+
+### Fork addition — `access_graph_query`
+
+**New tool** — `access_graph_query`: query the dependency graph without re-scanning.
 
 **Added**:
 - **`access_graph_query`** — pure-Python graph query tool that loads a previously-generated `graph.json` and answers targeted questions. Five actions: `neighbors` (BFS depth 1-3, directional), `impact` (transitive downstream walk), `path` (shortest path between two nodes), `orphans` (nodes with zero incoming edges), `summary` (stats + top-degree nodes). Smart node resolution (exact id, bare name, or group:name). `skip_fields` option to suppress noisy field-owner edges. Results capped at 200 items.

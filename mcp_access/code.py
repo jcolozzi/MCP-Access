@@ -150,6 +150,36 @@ def ac_list_objects(db_path: str, object_type: str = "all") -> dict:
 # Delete object
 # ---------------------------------------------------------------------------
 
+def _save_all_modules(app) -> None:
+    """Best-effort: persist dirty VBA modules so DoCmd.DeleteObject does not
+    pop 'Do you want to save changes to the design of module X?' (issue #31 —
+    the dirty state can come from user code run via eval, e.g. a
+    VBComponents.Add, so per-tool bookkeeping is not enough).
+
+    acCmdSaveAllModules = 280 (AcCommand).  Saves without compiling, unlike
+    acCmdCompileAndSaveAllModules (126) which fails on uncompilable projects.
+    RunCommand 280 can raise 2046 'not available now' without an applicable
+    module context -- fall back to saving loaded modules one by one.
+    Never raises.
+    """
+    try:
+        app.RunCommand(280)
+        return
+    except Exception:
+        pass
+    try:
+        mods = app.CurrentProject.AllModules
+        for i in range(mods.Count):
+            try:
+                m = mods.Item(i)
+                if m.IsLoaded:
+                    app.DoCmd.Save(5, m.Name)  # acModule = 5
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def ac_delete_object(
     db_path: str, object_type: str, object_name: str, confirm: bool = False,
 ) -> dict:
@@ -164,6 +194,7 @@ def ac_delete_object(
         )
     app = _Session.connect(db_path)
     try:
+        _save_all_modules(app)
         app.DoCmd.DeleteObject(AC_TYPE[object_type], object_name)
     except Exception as exc:
         raise RuntimeError(
@@ -404,7 +435,16 @@ def ac_set_code(db_path: str, object_type: str, name: str, code: str) -> str:
         # form/report, inject it via VBE instead of re-importing the whole
         # form definition (which fails for freshly-created forms with no
         # prior SaveAsText baseline).
-        if _looks_like_vba_only(code) and _object_exists(app, object_type, name):
+        if _looks_like_vba_only(code):
+            if not _object_exists(app, object_type, name):
+                # Without this check the VBA-only text would fall through to
+                # LoadFromText and die with an opaque "errors while importing".
+                raise ValueError(
+                    f"{object_type} '{name}' does not exist — VBA-only code can "
+                    f"only be injected into an existing {object_type}. Create it "
+                    f"first (access_create_form) or pass a full definition "
+                    f"(starting with 'Version =' / 'Begin {object_type.capitalize()}')."
+                )
             _inject_vba_after_import(app, object_type, name, code)
             invalidate_object_caches(object_type, name)
             return (

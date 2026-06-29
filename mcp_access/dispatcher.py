@@ -23,6 +23,7 @@ from .code import (
     ac_list_objects, ac_get_code, ac_set_code, ac_delete_object,
     ac_create_form, ac_export_structure, ac_clone_object,
 )
+from .build_form import ac_build_form
 from .database import (
     ac_create_database, ac_create_table, ac_alter_table, ac_table_info,
 )
@@ -38,12 +39,39 @@ from .relations import (
     ac_list_references, ac_manage_reference,
     ac_list_indexes, ac_manage_index,
 )
+from .lint import ac_lint_form
 from .maintenance import ac_compact_repair, ac_decompile_compact
 from .vba_exec import ac_run_macro, ac_run_vba, ac_eval_vba
 from .compile import ac_compile_vba
 from .export import ac_output_report, ac_transfer_data
 from .ui import ac_screenshot, ac_ui_click, ac_ui_type
 from .tips import ac_tips
+
+
+def _new_lines_to_code(val):
+    """Normalise a ``new_lines`` alias into a ``new_code`` string.
+
+    ``new_lines`` is accepted as a convenience alias for ``new_code`` so callers
+    can pass a list of lines instead of a single embedded-newline string (and so
+    a misnamed-arg call no longer silently degrades to a destructive delete).
+    Returns the joined code, or ``None`` when no usable value is present. Tolerates
+    string-serialising clients that send the list as a JSON-encoded string."""
+    if val is None:
+        return None
+    if isinstance(val, str):
+        stripped = val.strip()
+        if stripped.startswith("["):
+            try:
+                parsed = json.loads(stripped)
+                if isinstance(parsed, list):
+                    val = parsed
+            except (ValueError, TypeError):
+                pass
+        if isinstance(val, str):
+            return val  # plain string: treat as new_code verbatim
+    if isinstance(val, list):
+        return "\n".join("" if x is None else str(x) for x in val)
+    return str(val)
 
 
 def call_tool_sync(name: str, arguments: dict) -> str:
@@ -124,13 +152,27 @@ def call_tool_sync(name: str, arguments: dict) -> str:
 
         elif name == "access_vbe_replace_lines":
             ops = arguments.get("operations")
+            if ops:
+                # Per-op new_lines is an alias for new_code (don't override an
+                # explicit new_code already in the op).
+                for op in ops:
+                    if "new_code" not in op and "new_lines" in op:
+                        nc = _new_lines_to_code(op.get("new_lines"))
+                        if nc is not None:
+                            op["new_code"] = nc
+            # Single mode: new_lines alias → new_code (only when new_code absent/empty).
+            new_code = arguments.get("new_code", "")
+            if not new_code and "new_lines" in arguments:
+                nc = _new_lines_to_code(arguments.get("new_lines"))
+                if nc is not None:
+                    new_code = nc
             text = ac_vbe_replace_lines(
                 arguments["db_path"],
                 arguments["object_type"],
                 arguments["object_name"],
                 int(arguments.get("start_line", 0)),
                 int(arguments.get("count", 0)),
-                arguments.get("new_code", ""),
+                new_code,
                 operations=ops,
             )
 
@@ -219,6 +261,9 @@ def call_tool_sync(name: str, arguments: dict) -> str:
                 dict(arguments.get("props", {})),
                 class_name=arguments.get("class_name"),
                 control_name=arguments.get("control_name"),
+                skip_lint=bool(arguments.get("skip_lint", False)),
+                snap_to_grid=bool(arguments.get("snap_to_grid", False)),
+                full_lint=bool(arguments.get("full_lint", False)),
             )
             text = json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -255,6 +300,9 @@ def call_tool_sync(name: str, arguments: dict) -> str:
                 arguments["object_name"],
                 arguments["control_name"],
                 dict(arguments.get("props", {})),
+                skip_lint=bool(arguments.get("skip_lint", False)),
+                snap_to_grid=bool(arguments.get("snap_to_grid", False)),
+                full_lint=bool(arguments.get("full_lint", False)),
             )
             text = json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -283,15 +331,21 @@ def call_tool_sync(name: str, arguments: dict) -> str:
 
         # -- Linked tables ------------------------------------------------
         elif name == "access_list_linked_tables":
-            result = ac_list_linked_tables(arguments["db_path"])
+            result = ac_list_linked_tables(
+                arguments["db_path"],
+                arguments.get("name"),
+                bool(arguments.get("names_only", False)),
+                bool(arguments.get("mask_password", False)),
+            )
             text = json.dumps(result, ensure_ascii=False, indent=2)
 
         elif name == "access_relink_table":
             result = ac_relink_table(
                 arguments["db_path"],
                 arguments["table_name"],
-                arguments["new_connect"],
+                arguments.get("new_connect"),
                 bool(arguments.get("relink_all", False)),
+                bool(arguments.get("refresh", False)),
             )
             text = json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -475,6 +529,22 @@ def call_tool_sync(name: str, arguments: dict) -> str:
             )
             text = json.dumps(result, ensure_ascii=False, indent=2)
 
+        elif name == "access_build_form":
+            result = ac_build_form(
+                arguments["db_path"],
+                arguments["form_name"],
+                record_source=arguments.get("record_source"),
+                title=arguments.get("title"),
+                fields=arguments.get("fields"),
+                actions=arguments.get("actions"),
+                layout=arguments.get("layout", "single"),
+                default_view=arguments.get("default_view"),
+                theme=arguments.get("theme", "light"),
+                overwrite=bool(arguments.get("overwrite", False)),
+                skip_lint=bool(arguments.get("skip_lint", False)),
+            )
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+
         # -- Delete object ------------------------------------------------
         elif name == "access_delete_object":
             result = ac_delete_object(
@@ -500,6 +570,7 @@ def call_tool_sync(name: str, arguments: dict) -> str:
             result = ac_eval_vba(
                 arguments["db_path"],
                 arguments["expression"],
+                timeout=arguments.get("timeout"),
             )
             text = json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -533,6 +604,7 @@ def call_tool_sync(name: str, arguments: dict) -> str:
                 arguments["statements"],
                 stop_on_error=bool(arguments.get("stop_on_error", True)),
                 confirm_destructive=bool(arguments.get("confirm_destructive", False)),
+                limit=int(arguments.get("limit", 100)),
             )
             text = json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -553,6 +625,20 @@ def call_tool_sync(name: str, arguments: dict) -> str:
                 arguments["object_type"],
                 arguments["object_name"],
                 arguments["controls"],
+                skip_lint=bool(arguments.get("skip_lint", False)),
+                full_lint=bool(arguments.get("full_lint", False)),
+            )
+            text = json.dumps(result, ensure_ascii=False, indent=2)
+
+        elif name == "access_lint_form":
+            result = ac_lint_form(
+                arguments["db_path"],
+                arguments.get("object_type", "form"),
+                arguments["object_name"],
+                rules=arguments.get("rules"),
+                measure=arguments.get("measure", "auto"),
+                include_screenshot=bool(arguments.get("include_screenshot", False)),
+                max_violations=int(arguments.get("max_violations", 200)),
             )
             text = json.dumps(result, ensure_ascii=False, indent=2)
 

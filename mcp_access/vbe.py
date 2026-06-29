@@ -10,6 +10,7 @@ import html as html_mod
 import os
 import re
 import tempfile
+import threading
 from typing import Any
 
 from .core import (
@@ -21,6 +22,51 @@ from .constants import (
     CONTROL_SEARCH_PROPS,
 )
 from .helpers import text_matches, read_tmp
+
+
+# ---------------------------------------------------------------------------
+# DoCmd.Save watchdog helper (v0.7.49 — issue #33)
+# ---------------------------------------------------------------------------
+# DoCmd.Save can pop an error dialog ("Save isn't available now") when the
+# target module/form is open in the VBE.  Access shows the dialog and waits
+# for a click before raising the COM exception — the bare except already
+# swallows the error, but nothing dismissed the dialog, so the user had to
+# click "OK" after every VBE write call.
+#
+# Fix: wrap DoCmd.Save in a lightweight watchdog thread (same pattern as
+# _call_with_dialog_watchdog in maintenance.py) with a short 0.3 s grace
+# period so the dialog is dismissed automatically and never reaches the user.
+
+def _save_vbe_module(app, obj_type_code: int, object_name: str) -> None:
+    """Call DoCmd.Save with a dialog-dismiss watchdog (best-effort)."""
+    from .vba_exec import _dismiss_access_dialogs
+    try:
+        _h = app.hWndAccessApp
+        hwnd = int(_h() if callable(_h) else _h)
+    except Exception:
+        hwnd = 0
+
+    stop_event = threading.Event()
+
+    def _watchdog():
+        if stop_event.wait(0.3):
+            return
+        while not stop_event.is_set():
+            if hwnd:
+                try:
+                    _dismiss_access_dialogs(hwnd)
+                except Exception:
+                    pass
+            stop_event.wait(0.3)
+
+    t = threading.Thread(target=_watchdog, daemon=True)
+    t.start()
+    try:
+        app.DoCmd.Save(obj_type_code, object_name)
+    except Exception:
+        pass  # best-effort; compact/close will also persist
+    finally:
+        stop_event.set()
 
 
 # ---------------------------------------------------------------------------
@@ -40,6 +86,10 @@ _VBEXT_PK_LET = 1
 _VBEXT_PK_SET = 2
 _VBEXT_PK_GET = 3
 _ALL_PROC_KINDS = (0, 1, 2, 3)
+
+# Max per-object errors reported by the multi-object scans (search_all /
+# find_usages / find_definition) before collapsing into the skipped count.
+_SEARCH_ERROR_CAP = 20
 
 # Maps regex-captured keyword → VBE kind for ac_vbe_module_info
 _KEYWORD_TO_KIND: dict[str, int] = {
@@ -281,12 +331,27 @@ def _check_module_health(cm: Any, cache_key: str, expected_total: int = 0) -> li
     all_code = cm.Lines(1, total)
     lines = all_code.splitlines()
 
-    # Check 1 — Option placement: should be in first 5 lines
+    # Check 1 — Option placement. Option statements must precede all executable
+    # code, but a comment/blank header of any length is perfectly legal (e.g. a
+    # banner comment block). So flag an Option line only when real code already
+    # appeared above it — NOT by a fixed line-number threshold, which false-
+    # positives on long headers (a 6-line header pushes Option to line 7).
+    seen_code = False
     for i, line in enumerate(lines):
-        if _OPTION_RE.match(line.rstrip('\r\n')) and i >= 5:
-            warnings.append(
-                f"WARNING: '{line.strip()}' found at line {i + 1} (expected in first 5 lines)"
-            )
+        stripped = line.strip()
+        low = stripped.lower()
+        if _OPTION_RE.match(line.rstrip('\r\n')):
+            if seen_code:
+                warnings.append(
+                    f"WARNING: '{stripped}' found at line {i + 1} after executable "
+                    f"code (Option statements must precede all code)"
+                )
+            continue
+        # Blanks, comments and other Option-family lines are not "code".
+        if not stripped or stripped.startswith("'") or low.startswith("rem ") \
+                or low.startswith("option "):
+            continue
+        seen_code = True
 
     # Check 2 — Duplicate labels (scoped per procedure).
     # VBA accepts combinations like "Public Static Sub Foo" — allow scope
@@ -399,6 +464,10 @@ def ac_vbe_get_lines(
 ) -> str:
     """Reads a range of lines without exporting the entire module."""
     if end_line is not None and count is None:
+        if end_line < start_line:
+            raise ValueError(
+                f"end_line ({end_line}) must be >= start_line ({start_line})"
+            )
         count = end_line - start_line + 1
     if count is None:
         raise ValueError("Either count or end_line must be provided")
@@ -411,6 +480,10 @@ def ac_vbe_get_lines(
     all_code = _cm_all_code(cm, cache_key)
     all_lines = all_code.splitlines()
     total = len(all_lines)
+    if total == 0:
+        raise ValueError(
+            f"Module '{object_name}' is empty (0 lines) — nothing to read."
+        )
     if start_line < 1 or start_line > total:
         raise ValueError(f"start_line {start_line} out of range (1-{total})")
     actual = min(count, total - start_line + 1)
@@ -429,6 +502,10 @@ def ac_vbe_get_proc(
     Returns information and code for a specific procedure.
     Much more efficient than ac_get_code when only one function is needed.
     Returns: start_line, body_line, count, code.
+      - start_line: VBE proc start — INCLUDES the blank/comment lines above the
+        proc (use for whole-proc operations).
+      - body_line: the Sub/Function/Property declaration line (use for body
+        line-range edits).
     """
     app = _Session.connect(db_path)
     _close_form_design_view(app, object_type, object_name)
@@ -458,6 +535,8 @@ def ac_vbe_module_info(
     """
     Returns the total lines and the list of procedures with their positions.
     Useful as a quick index before editing, without downloading the full code.
+    Per proc: start_line (VBE proc start — includes preceding blank/comment
+    lines) and body_line (the Sub/Function/Property declaration line).
     """
     app = _Session.connect(db_path)
     _close_form_design_view(app, object_type, object_name)
@@ -495,9 +574,15 @@ def ac_vbe_module_info(
                     # in the source text for the matching End keyword.
                     end_kw = ("end property" if keyword.lower().startswith("property")
                               else f"end {keyword}".lower())
+                    # \b + optional trailing comment: "End Sub ' done" is
+                    # valid VBA and must still close the proc.
+                    end_re = re.compile(
+                        r"^\s*" + re.escape(end_kw) + r"\s*(?:'.*)?$",
+                        re.IGNORECASE,
+                    )
                     count = 1
                     for j in range(i - 1, total):  # 0-based scan from declaration
-                        if all_lines[j].strip().lower() == end_kw:
+                        if end_re.match(all_lines[j]):
                             count = (j + 1) - i + 1  # both 1-based, inclusive
                             break
                     procs.append({"name": pname, "keyword": keyword,
@@ -566,6 +651,14 @@ def ac_vbe_replace_lines(
 
     Returns the status + preview of inserted code to avoid an extra get_proc call.
     """
+    if not operations and start_line < 1:
+        # 0 is the "not provided" sentinel from the dispatcher — turn the
+        # cryptic "start_line 0 out of range (1-N)" into an actionable error.
+        raise ValueError(
+            "start_line is required (1-based). Pass start_line/count/new_code "
+            "for a single edit, or operations=[{start_line, count, new_code}, "
+            "...] for batch mode."
+        )
     app = _Session.connect(db_path)
     _close_form_design_view(app, object_type, object_name)
 
@@ -587,11 +680,7 @@ def ac_vbe_replace_lines(
             results.append(r)
         # Persist
         cache_key = f"{object_type}:{object_name}"
-        try:
-            obj_type_code = AC_TYPE.get(object_type, 5)
-            app.DoCmd.Save(obj_type_code, object_name)
-        except Exception:
-            pass
+        _save_vbe_module(app, AC_TYPE.get(object_type, 5), object_name)
         new_total = cm.CountOfLines
         total_deleted = sum(r["deleted"] for r in results)
         total_inserted = sum(r["inserted"] for r in results)
@@ -606,6 +695,19 @@ def ac_vbe_replace_lines(
             f"Total: {total_deleted} deleted, {total_inserted} inserted "
             f"→ module now has {new_total} lines"
         )
+        # Same destructive no-op note as single mode: an operation that
+        # deleted lines but inserted nothing usually means new_code arrived
+        # empty (misnamed argument) — surface it instead of hiding it.
+        destructive = [r for r in results if r["deleted"] > 0 and r["inserted"] == 0]
+        if destructive:
+            ops_desc = ", ".join(
+                f"L{r['start_line']} ({r['deleted']} deleted)" for r in destructive
+            )
+            status += (
+                f"\nnote: {len(destructive)} operation(s) deleted lines and "
+                f"inserted nothing: {ops_desc}. If you meant to REPLACE, pass "
+                f"the new text in new_code."
+            )
         if health:
             status += f"\n" + "\n".join(health)
         return status
@@ -614,11 +716,7 @@ def ac_vbe_replace_lines(
     r = _exec_single_replace(cm, object_type, object_name, start_line, count, new_code)
     cache_key = f"{object_type}:{object_name}"
     # Persist VBE changes to .accdb — without this, changes are only in memory
-    try:
-        obj_type_code = AC_TYPE.get(object_type, 5)  # acModule=5 default
-        app.DoCmd.Save(obj_type_code, object_name)
-    except Exception:
-        pass  # save is best-effort; compact/close will also persist
+    _save_vbe_module(app, AC_TYPE.get(object_type, 5), object_name)
     new_total = cm.CountOfLines
     # Health check
     health = _check_module_health(cm, cache_key)
@@ -627,6 +725,15 @@ def ac_vbe_replace_lines(
         f"({r['deleted']} deleted, {r['inserted']} inserted){r['clamp_note']} "
         f"→ module now has {new_total} lines"
     )
+    # Surface a destructive no-op: lines were deleted but nothing was inserted.
+    # This is the footgun where new_code/new_lines arrives empty (e.g. a misnamed
+    # argument) and a replace silently degrades into a pure delete.
+    if r["deleted"] > 0 and r["inserted"] == 0:
+        status += (
+            f"\nnote: {r['deleted']} line(s) deleted and nothing inserted "
+            f"(new_code/new_lines was empty). If you meant to REPLACE, pass the "
+            f"new text in new_code or new_lines."
+        )
     if health:
         status += f"\n" + "\n".join(health)
     if new_code:
@@ -705,6 +812,8 @@ def ac_vbe_search_all(
     app = _Session.connect(db_path)
     objects = ac_list_objects(db_path, "all")
     results: list[dict] = []
+    errors: list[dict] = []
+    skipped = 0
     total = 0
     truncated = False
 
@@ -735,12 +844,29 @@ def ac_vbe_search_all(
                         "object_name": obj_name,
                         "matches": obj_matches,
                     })
-            except Exception:
-                continue  # skip objects without accessible CodeModule
+            except Exception as exc:
+                # Never swallow this silently: if the whole VBA project fails
+                # to load (broken reference, Trust Center...) every object
+                # lands here and a clean "0 matches" would be a lie.
+                skipped += 1
+                if len(errors) < _SEARCH_ERROR_CAP:
+                    errors.append({
+                        "object": f"{obj_type}:{obj_name}",
+                        "error": str(exc).splitlines()[0] if str(exc) else repr(exc),
+                    })
+                continue
 
     out: dict = {"total_matches": total, "results": results}
     if truncated:
         out["truncated"] = True
+    if skipped:
+        out["objects_skipped"] = skipped
+        out["errors"] = errors
+        out["warning"] = (
+            f"{skipped} object(s) had no accessible CodeModule — results may "
+            "be incomplete. If ALL objects failed, the VBA project is likely "
+            "not loading (broken reference / Trust Center)."
+        )
     return out
 
 
@@ -804,6 +930,8 @@ def ac_find_usages(
             })
     total = len(vba_matches)
     truncated = vba_result.get("truncated", False)
+    errors: list[dict] = list(vba_result.get("errors", []))
+    skipped = vba_result.get("objects_skipped", 0)
 
     # 2. Query matches — delegates to ac_search_queries
     query_matches: list[dict] = []
@@ -854,7 +982,13 @@ def ac_find_usages(
                                     if total >= max_results:
                                         truncated = True
                                     break
-                except Exception:
+                except Exception as exc:
+                    skipped += 1
+                    if len(errors) < _SEARCH_ERROR_CAP:
+                        errors.append({
+                            "object": f"{obj_type}:{obj_name}",
+                            "error": str(exc).splitlines()[0] if str(exc) else repr(exc),
+                        })
                     continue
 
     out: dict = {
@@ -866,6 +1000,14 @@ def ac_find_usages(
     }
     if truncated:
         out["truncated"] = True
+    if skipped:
+        out["objects_skipped"] = skipped
+        out["errors"] = errors
+        out["warning"] = (
+            f"{skipped} object(s) could not be scanned — results may be "
+            "incomplete. If ALL objects failed, the VBA project is likely "
+            "not loading (broken reference / Trust Center)."
+        )
     return out
 
 
@@ -881,7 +1023,9 @@ def ac_vbe_replace_proc(
     Replaces a complete procedure (Sub/Function/Property) by name.
     Calculates boundaries automatically via COM (ProcStartLine/ProcCountLines),
     eliminating calculation errors from the caller.
-    If new_code is empty, deletes the procedure.
+    Preserves the blank separator line above the proc when replacing (delete/
+    insert happen below the leading blanks).
+    If new_code is empty, deletes the procedure AND its leading blank separator.
     """
     app = _Session.connect(db_path)
     _close_form_design_view(app, object_type, object_name)
@@ -900,25 +1044,41 @@ def ac_vbe_replace_proc(
     # Clamp count to actual module total (ProcCountLines can inflate the last proc)
     total = cm.CountOfLines
     count = min(count, total - start + 1)
-    # Backup original proc in RAM for rollback if it fails
-    backup_code = cm.Lines(start, count)
     # Strip Option lines if proc is NOT at the top of the module
     option_warnings = []
     if new_code and start > 5:
         new_code, option_warnings = _strip_option_lines(new_code)
+    # ProcStartLine = previous proc's End + 1, so it INCLUDES the blank
+    # separator line(s) above this proc. When REPLACING, preserve that
+    # separator (delete/insert below it) so we don't eat the blank line
+    # between procs on every replace. A pure delete (new_code == '') removes
+    # the whole range, separator included — that correctly closes the gap
+    # (the following proc still owns its own leading blank).
+    del_start, del_count = start, count
+    if new_code:
+        lead = 0
+        for ln in cm.Lines(start, count).splitlines():
+            if ln.strip() == "":
+                lead += 1
+            else:
+                break
+        if 0 < lead < count:
+            del_start, del_count = start + lead, count - lead
+    # Backup the portion we delete, for rollback on failure
+    backup_code = cm.Lines(del_start, del_count)
     # Delete old procedure and insert new one with automatic rollback
     try:
-        cm.DeleteLines(start, count)
+        cm.DeleteLines(del_start, del_count)
         inserted = 0
         if new_code:
             normalized = new_code.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\r\n")
-            pre_insert_total = total - count
-            cm.InsertLines(start, normalized)
+            pre_insert_total = total - del_count
+            cm.InsertLines(del_start, normalized)
             inserted = cm.CountOfLines - pre_insert_total
     except Exception:
         # Restore original code
         try:
-            cm.InsertLines(start, backup_code)
+            cm.InsertLines(del_start, backup_code)
         except Exception:
             pass  # best-effort restore
         raise
@@ -929,7 +1089,7 @@ def ac_vbe_replace_proc(
     action = "replaced" if new_code else "deleted"
     status = (
         f"OK: proc '{proc_name}' {action} "
-        f"({count} deleted, {inserted} inserted) "
+        f"({del_count} deleted, {inserted} inserted) "
         f"→ module now has {new_total} lines"
     )
     if option_warnings:
@@ -1047,11 +1207,7 @@ def ac_vbe_patch_proc(
 
     # Persist VBE changes to .accdb — without this, patches to form/report
     # code-behind can be lost because the object's dirty flag is not set.
-    try:
-        obj_type_code = AC_TYPE.get(object_type, 5)
-        app.DoCmd.Save(obj_type_code, object_name)
-    except Exception:
-        pass
+    _save_vbe_module(app, AC_TYPE.get(object_type, 5), object_name)
     new_total = cm.CountOfLines
     try:
         new_count = cm.ProcCountLines(proc_name, kind) if applied > 0 else 0
@@ -1104,11 +1260,7 @@ def ac_vbe_append(
     inserted = cm.CountOfLines - total
     cache_key = f"{object_type}:{object_name}"
     # Persist VBE changes to .accdb
-    try:
-        obj_type_code = AC_TYPE.get(object_type, 5)
-        app.DoCmd.Save(obj_type_code, object_name)
-    except Exception:
-        pass
+    _save_vbe_module(app, AC_TYPE.get(object_type, 5), object_name)
     new_total = cm.CountOfLines
     # Health check
     health = _check_module_health(cm, cache_key)
@@ -1122,7 +1274,7 @@ def ac_vbe_append(
 
 # ---------------------------------------------------------------------------
 # Find definition — "Go To Definition" for VBA symbols
-# (requested by Tom — @TvanStiphout-Home, thanks!)
+# (requested by @TvanStiphout-Home, thanks!)
 # ---------------------------------------------------------------------------
 
 _FD_PROC_RE = re.compile(
@@ -1334,6 +1486,8 @@ def ac_find_definition(
     app = _Session.connect(db_path)
     objects = ac_list_objects(db_path, "all")
     definitions: list[dict] = []
+    errors: list[dict] = []
+    skipped = 0
 
     def _stop() -> bool:
         return first_only and bool(definitions)
@@ -1348,8 +1502,16 @@ def ac_find_definition(
                 cm = _get_code_module(app, obj_type, obj_name)
                 cache_key = f"{obj_type}:{obj_name}"
                 all_code = _cm_all_code(cm, cache_key)
-            except Exception:
-                continue  # skip modules we cannot access
+            except Exception as exc:
+                # Surface inaccessible modules instead of silently reporting
+                # "0 definitions" when the whole VBA project fails to load.
+                skipped += 1
+                if len(errors) < _SEARCH_ERROR_CAP:
+                    errors.append({
+                        "object": f"{obj_type}:{obj_name}",
+                        "error": str(exc).splitlines()[0] if str(exc) else repr(exc),
+                    })
+                continue
             if not all_code:
                 continue
 
@@ -1567,8 +1729,17 @@ def ac_find_definition(
                                 if _stop():
                                     break
 
-    return {
+    out: dict = {
         "symbol": symbol,
         "total": len(definitions),
         "definitions": definitions,
     }
+    if skipped:
+        out["objects_skipped"] = skipped
+        out["errors"] = errors
+        out["warning"] = (
+            f"{skipped} object(s) had no accessible CodeModule — results may "
+            "be incomplete. If ALL objects failed, the VBA project is likely "
+            "not loading (broken reference / Trust Center)."
+        )
+    return out

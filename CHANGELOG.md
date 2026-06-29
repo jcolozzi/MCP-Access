@@ -1,5 +1,313 @@
 # Changelog
 
+## 0.7.46 — 2026-06-19
+
+Real design taste for `access_build_form` — three curated **design directions**
+replace the ad-hoc themes, plus the fix for the washed-out two-tone header band
+they surfaced. No new tool (still **67**).
+
+### Added
+
+- **Three curated design directions** for `access_build_form` (`theme=`):
+  `despacho` (serif Constantia title on warm paper, teal accent band),
+  `panel` (Segoe UI Semibold, a white card on a cool canvas, slate band) and
+  `archivo` (serif Cambria, warm editorial, spacious, clay band). Each is a
+  *coherent bundle* — a typeface with character, an intentional modular type
+  scale, a dominant+accent palette with **WCAG-verified contrast**, a spacing
+  density and an accent header band — translating real design-system thinking
+  into what native Access can render. Each passes the lint clean by construction.
+- **Design tokens** in `mcp_access/design_defaults.py`: `type_scale(base, ratio)`
+  (a modular scale rounded to whole points), `SPACE` (a closed spacing scale;
+  the legacy `MARGIN_X`/`GAP_LABEL`/… are now aliases into it, same values),
+  `DENSITY` (compact/comfortable/spacious — margins & gaps only, never control
+  sizes) and `DIRECTIONS` (the three palettes, built with `bgr()` straight from
+  the hex so they can't drift).
+- **`access_tips('design')`** — the design guide the model reads: the three
+  directions, the principles (typeface with character, cohesive palette,
+  hierarchy, rhythm, containment, active-voice copy) and the **honest ceiling**
+  (native Access has no gradients, shadows, rounded corners, blur or animation).
+- **Two `info`-only lint rules:** `generic_font` (flags Arial/Roboto/Inter/Times
+  New Roman/MS Sans Serif — a closed list) and a `type_hierarchy` extension of
+  the `hierarchy` rule (the header title should be larger than the body text).
+  Both `info`, so they never change the verdict nor reach the embedded mutation
+  lint.
+
+### Fixed
+
+- **Two-tone header band / unpainted canvas.** `build_form`'s `_set_section`
+  resolved sections via `Form.Section(index)`, which pywin32 can't late-bind
+  (it raises *"member not found"* for every index) — so the call failed
+  **silently**: the canvas colour was never painted and the header/footer kept
+  Access' oversized default heights, leaving the themed light-blue header
+  showing past the accent rectangle (the "two-tone band"). Sections are now
+  resolved by their **named** properties (`Detail`/`FormHeader`/`FormFooter`),
+  which bind correctly, and a header band is painted on the section BackColor
+  (full document-window width) with the Rectangle kept as a fallback.
+
+## 0.7.45 — 2026-06-19
+
+Making the LLM design **much** better Access forms — by moving the layout
+arithmetic out of the model and into the MCP (no skill, no hooks required, as
+requested). One new tool — tool count goes **66 → 67**.
+
+### Added
+
+- **`access_build_form` — declarative form auto-layout.** Instead of many
+  blind `access_create_control` calls with hand-picked twips, describe the form
+  declaratively: a `title`, an ordered list of `fields` (string or
+  `{field, label, control, name, control_source, row_source, width_units,
+  height, props}`), a row of `actions` (footer buttons), `layout`
+  (`single`|`two-column`) and `theme` (`light`|`plain`). The tool computes every
+  Left/Top/Width/Height from a canonical 60-twip grid, applies a closed
+  WCAG-safe palette, binds matching `record_source` columns, assigns a
+  per-section tab order, sizes the form + header/footer sections, and attaches
+  the embedded lint. A form it builds passes the lint clean by construction. The
+  geometry is a pure function (`_plan_layout`) covered by
+  `tests/test_build_form_layout.py`.
+- **Design tokens (`mcp_access/design_defaults.py`).** Single source of truth
+  for the grid, standard control sizes, margins/gaps, fonts and a closed BGR
+  palette (`bgr(r,g,b)` builds an Access colour Long; `snap(v)` rounds to the
+  grid). `lint.py`, `build_form.py` and `access_tips('layout')` all read from it.
+- **`snap_to_grid` (opt-in, default false)** on `access_create_control` and
+  `access_set_control_props` — rounds Left/Top/Width/Height to the 60-twip grid;
+  `-1` (auto) values are left untouched.
+- **`access_tips('layout')`** — the canonical numbers, the columnar/two-column
+  recipe, the palette and a `build_form` example, for hand placement.
+
+### Changed
+
+- **Four new lint rules, all `info`-severity:** `grid_alignment` (off the
+  60-twip grid), `spacing_consistency` (uneven column gaps), `edge_margin`
+  (control hugging the form edge), `hierarchy` (action text smaller than body
+  text). They enrich the full `access_lint_form` report but **never** change the
+  PASS/REVIEW/FAIL verdict (which only counts errors/warnings) and **never**
+  reach the compact lint embedded in mutation results — so the embedded path is
+  not made noisier. Each is deliberately conservative.
+
+## 0.7.44 — 2026-06-12
+
+Follow-ups to the attached-mode dialog hangs reported by
+[@CaptainStormfield](https://github.com/CaptainStormfield)
+([#31](https://github.com/unmateria/MCP-Access/issues/31)). The core complaint
+(global watchdog disabled on attached instances) was already fixed in v0.7.43,
+released the same day as the reported incidents — the remaining gaps are
+closed here. No new tools — tool count stays **66**.
+
+### Fixed
+
+- **`access_eval_vba` gains an optional `timeout` parameter** — same dialog
+  watchdog treatment as `access_run_vba`. With it, a MsgBox/InputBox (or any
+  modal) raised by the evaluated expression is auto-dismissed and an
+  actionable error returned, instead of relying solely on the global
+  watchdog's grace period. Covers both `Application.Eval` and the temp-module
+  fallback (which runs via `Application.Run` and is just as blockable). (#31)
+- **Stale `_mcp_eval_wrapper` temp modules no longer wedge the session.**
+  When the eval fallback's `VBComponents.Remove` failed (e.g. a modal was
+  blocking), the orphan module's dangling name broke every later call with
+  *"cannot find the procedure 'Module1._mcp_eval_wrapper'"* until a full
+  reconnect. The fallback now sweeps leftover marker-tagged std modules
+  before creating a new one (best-effort, scans only the first lines of each
+  std module). (#31)
+- **`access_delete_object` no longer triggers the *"Do you want to save
+  changes to the design of module X?"* prompt.** Dirty VBA modules (often
+  left by user code run via eval, e.g. a `VBComponents.Add`) are persisted
+  best-effort before `DoCmd.DeleteObject` — `RunCommand acCmdSaveAllModules`
+  (280), falling back to per-module `DoCmd.Save`. Deliberately NOT applied to
+  close/quit paths: on attached instances that would silently persist the
+  interactive user's half-finished VBE edits without being asked. (#31)
+- **Watchdog dismissals are now surfaced in the tool result.** Every dialog
+  auto-dismissed by any watchdog records its title; if it happened while a
+  tool call was in flight, the result gains a note naming the dialog —
+  converting a silent dismissal (whose Cancel may have altered the outcome)
+  into a traceable event. (#31)
+
+## 0.7.43 — 2026-06-11
+
+Wedged-session detection — thanks to
+[@CaptainStormfield](https://github.com/CaptainStormfield)
+([#30](https://github.com/unmateria/MCP-Access/pull/30)) — plus a usability
+bughunt round across the whole server. No new tools — tool count stays **66**.
+
+### Fixed
+
+- **Self-closing databases no longer wedge the COM session permanently**
+  (from PR #30 by @CaptainStormfield, reimplemented with refinements). Two
+  holes worked together: `_switch()` recorded `_db_open` without verifying the
+  database actually stayed open (a startup form erroring out — e.g. broken
+  backend links with `AllowBypassKey=False` defeating the SHIFT bypass — can
+  close the db during the open), and `connect()`'s health check only probed
+  `app.Visible`, which passes on an Access instance whose database was closed
+  under it. On attached instances, reconnects re-attached to the same broken
+  instance forever. Now: `_switch()` validates `CurrentDb()` after the open and
+  raises an actionable error (naming AutoExec/startup-form failure, broken
+  links, `AllowBypassKey=False`) after resetting the session via `quit()`;
+  `connect()` detects a dead db on an otherwise-alive instance and
+  auto-reconnects with a specific log message. The same post-open validation
+  was added to `access_create_database`'s reopen path (a gap the PR didn't
+  cover).
+- **Modal dialogs no longer hang VBE tool calls on ATTACHED Access instances.**
+  The v0.7.40 global dialog watchdog was disabled entirely when the session
+  attached to the user's running Access (to never dismiss an interactive
+  user's dialogs) — but that left any modal provoked by OUR blocked COM call
+  (e.g. *"Error accessing file. Network connection may have been lost."* from
+  a VBA project with a `TYPE_E_LIBNOTREGISTERED` reference) hanging the tool
+  call until a human clicked, observed for ~1 hour in the field. The watchdog
+  now also runs on attached instances but only dismisses dialogs while one of
+  our tool calls has been in flight longer than a conservative 5 s grace
+  (vs 3 s for spawned). A dialog with no tool call in flight belongs to the
+  interactive user and is never touched.
+- **`access_vbe_search_all` / `access_find_usages` / `access_find_definition`
+  no longer report a clean `total: 0` when modules are inaccessible.** Each
+  per-object failure used to be swallowed (`except: continue`) — so a VBA
+  project that fails to load returned "0 matches", a false *"it doesn't
+  exist"*. Results now include `objects_skipped`, an `errors` list (capped at
+  20) and a warning when anything was skipped.
+- **`access_list_references` no longer dies on a broken reference.** Reading
+  `FullPath` on an unregistered library raises `com_error` and killed the whole
+  call — exactly when you need the tool most. Every property is now read
+  defensively (`null` on failure, reference marked `is_broken`), and the
+  result carries `broken_count` + a warning.
+- **Unclosed `/* ...` block comment no longer slips past the destructive-SQL
+  guard.** `_sql_effective_prefix` returned `""` for an unclosed comment, so
+  `/*\nDELETE FROM t` was classified non-destructive. Now fails closed by
+  classifying the remaining text.
+- **`access_set_code` with VBA-only code for a non-existent form/report** now
+  raises a clear error ("create it first with access_create_form, or pass a
+  full definition") instead of falling through to `LoadFromText` and dying
+  with an opaque *"errors while importing"*.
+- **`access_vbe_module_info` text fallback** (used when VBE can't locate a
+  proc variant) now recognises `End Sub ' comment` — a trailing comment after
+  the End keyword no longer breaks the proc-length scan.
+
+### Improved
+
+- **`access_vbe_replace_lines`**: omitting `start_line` in single mode now
+  raises *"start_line is required (1-based)…"* instead of the cryptic
+  *"start_line 0 out of range (1-N)"*. Batch mode gained the same
+  destructive-delete note single mode already had (operations that delete
+  lines but insert nothing are called out — the misnamed-argument footgun).
+- **`access_execute_batch`**: new optional `limit` parameter for SELECT rows
+  per statement (1-10000, default 100 — previously hardcoded).
+- **`access_vbe_get_lines`**: an empty module now reports *"module is empty
+  (0 lines)"* instead of *"start_line 1 out of range (1-0)"*, and
+  `end_line < start_line` is rejected with a clear message.
+
+## 0.7.42 — 2026-06-06
+
+VBE procedure-editing fixes from field reports (thanks to
+[@TvanStiphout-Home](https://github.com/TvanStiphout-Home)). No new tools — tool
+count stays **66**.
+
+### Fixed
+
+- **`access_vbe_replace_proc` no longer eats the blank separator line above a
+  procedure.** `ProcStartLine` is the previous proc's `End` + 1, so it *includes*
+  the blank line VBE attributes to the proc; the old code deleted from there and
+  re-inserted code with no leading blank, consuming the separator on every
+  replace. Replaces now preserve the leading blank line(s) — delete/insert happen
+  below them. A pure delete (`new_code=''`) still removes the whole range incl.
+  the leading blank (so deleting a proc closes its gap cleanly).
+- **No more spurious "Option … expected in first 5 lines" warning on modules
+  with a long comment header** (e.g. a banner block pushing `Option Compare` past
+  line 5). The structural health check replaced its fixed line-number threshold
+  with a rule that flags an Option statement only when real (non-comment,
+  non-blank) code already appeared above it — still catching genuinely misplaced
+  Option statements.
+
+### Added
+
+- **`access_vbe_replace_lines` accepts `new_lines`** (a list of strings, joined
+  with `\n`; `''` entries become blank lines) as an alias for `new_code`. This
+  closes a destructive footgun: a call that passed the code under a wrong key
+  left `new_code` empty and silently degraded into a pure delete. A replace that
+  deletes lines but inserts nothing now also appends an explicit note to its
+  result, so a destructive no-op is never silent.
+
+### Changed
+
+- `access_vbe_get_proc` / `access_vbe_module_info` descriptions and docstrings
+  now spell out `start_line` (VBE proc start — includes preceding blank/comment
+  lines) vs `body_line` (the `Sub`/`Function`/`Property` declaration line).
+  `access_tips('vbe')` documents both, the separator-preserving replace, and
+  `new_code=''` deletion.
+
+### Tests
+
+- `tests/test_vbe_fixes.py` — 11 COM-free tests for the Option-placement check
+  and the `new_lines` alias normalisation. Blank-separator preservation and the
+  end-to-end `new_lines` path were verified with a live COM integration run.
+
+## 0.7.41 — 2026-05-29
+
+Adds **deterministic UI design validation** so the assistant stops accepting
+objectively broken form/report layouts. **65 → 66 tools.**
+
+### Added
+
+- **`access_lint_form`** — pure-Python, rules-based lint of a form/report.
+  Returns structured JSON violations with `summary.verdict` (PASS / REVIEW /
+  FAIL) and per-violation `suggested_fix`. Rules: `contrast` (WCAG 2.1
+  ratio — catches white-on-white & low-contrast text), `overlap`,
+  `out_of_bounds`, `truncation`, `sibling_inconsistency`, `misalignment`,
+  `invisible_or_zero_size`. Static — one `SaveAsText` export, never opens
+  Design view. `measure="auto"|"wizhook"|"heuristic"` (WizHook gives exact
+  rendered text width when the VBA project is compiled; otherwise a
+  conservative heuristic).
+- **Embedded enforcement.** `access_set_control_props`,
+  `access_set_multiple_controls` and `access_create_control` now attach a
+  compact `lint` block (errors + warnings) to their result **automatically**.
+  The validation is deterministic and lives entirely inside the MCP — it
+  cannot be skipped or "talked past" by the model. `skip_lint=true` opts out
+  for bulk programmatic edits. A lint failure never breaks the mutation.
+- `access_tips('lint')` documents the rules, thresholds and colour encoding.
+- Unit tests: `tests/test_lint.py` (29 COM-free tests for colour decoding,
+  WCAG contrast, geometry parsing, and every rule incl. false-positive guards).
+
+### Notes
+
+False-positive guards, hardened against a real 85-control ERP form (findings
+dropped 62 → 10, remainder genuine):
+
+- **Conditional formatting** overrides colours at runtime (binary in the export)
+  → contrast skips + notes those controls.
+- **Captions wrap** — Labels *and* CommandButtons; line breaks (`\015\012`) are
+  split, truncation compares wrapped-line count vs lines that fit the height.
+- **`sibling_inconsistency` clusters** values: two legitimate sizes (main vs
+  inline buttons) are both accepted; only a lone outlier flags.
+- **Transparent buttons** stacked on styled labels (the custom-button pattern)
+  are not flagged as overlaps.
+- **Heuristic width is calibrated** for narrow UI fonts (≈0.46×) and only flags
+  overflow past 1.25× — bold header labels that fit are no longer flagged.
+- Absent dimensions inherit form defaults (not zero); attached labels,
+  cross-tab-page controls, container Pages and transparent layering never count
+  as overlaps; icon buttons aren't measured for caption truncation.
+- Access auto-grows form Width / section Height to fit controls, so horizontal
+  `out_of_bounds` rarely fires for forms (still effective for reports and
+  negative coordinates).
+
+## 0.7.40 — 2026-05-29
+
+Fixes an indefinite hang on databases whose **startup form raises a blocking
+modal** during open / VBE access.
+
+### Fixed
+
+- **Global dialog watchdog.** Until now the dialog-dismiss watchdog only ran
+  during `open` / `compile` / `run_vba`. Operations that access the VBE
+  (`vbe_get_proc`, `find_definition`, `module_info`, ...) had **no** watchdog,
+  so a modal raised by a DB's startup form — e.g.
+  `"Error accessing file. Network connection may have been lost."` on a DB with
+  `StartupForm` set — would hang the COM call forever (observed: a ~1-hour hang
+  on one such database). `_Session` now starts a background watchdog in
+  `_launch()` that dismisses Access-owned `#32770` / wizard dialogs which
+  persist past a 3 s grace period, for the whole lifetime of the spawned Access
+  process. The grace period lets operation-specific watchdogs handle (and
+  screenshot) their own dialogs first; the global thread only backstops
+  un-watched operations. It is **not** started when attached to an existing
+  interactive user session.
+- Factored the dialog enumeration into `_find_dialog_hwnds_by_pid()` (shared by
+  the dismisser and the new watchdog).
+
 ## 0.7.39 — 2026-05-28
 
 Hardening of the v0.7.38 `_looks_like_vba_only` detector. No behaviour change
