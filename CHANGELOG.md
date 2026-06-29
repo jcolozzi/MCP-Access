@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.7.50
+
+Ports the upgraded **dependency-graph** functionality from the PowerShell
+AccessPOSH grapher into the Python server — richer node metadata, an optional
+raw-export debug mode, and a substantially upgraded HTML viewer with built-in
+analytical reports. No new tools (still **69**); `access_graph` /
+`access_graph_query` gain capability.
+
+### Added
+
+- **`raw_export_mode` parameter on `access_graph`** (`none` | `debug`, default
+  `none`). `none` computes `rawHash`/`rawSize` from temporary `SaveAsText`
+  exports and cleans them up. `debug` additionally keeps the raw exports under
+  `<out>/raw/{forms,reports,queries,macros,modules}` and runs a supplemental
+  pass so **every** UI/query object carries raw meta + a kept file — even
+  objects whose heuristic pass was skipped (e.g. when code/macro heuristics are
+  off). The pass is idempotent: objects already carrying `rawHash` are left
+  untouched.
+- **Enriched node metadata** on `graph.json`:
+  - `sql` nodes — `sqlPath` (path to the extracted `.sql` file) and a merged
+    `origin` list (see Changed).
+  - `field` nodes — `ownerId` and `ownerGroup` (the owning table/query node).
+  - `query` nodes — `connect` (the `Connect` string for pass-through / linked
+    sources) plus `rawHash` / `rawSize` / `rawPath` when raw export ran.
+  - `form` / `report` / `macro` / `module` nodes — `rawHash` / `rawSize` /
+    `rawPath` when raw export ran.
+- **Upgraded HTML viewer** (`viewer.html`) ported wholesale from AccessPOSH:
+  ten analytical **Reports** panels (broken objects, orphans, inline-SQL
+  inventory, linked tables, high fan-in, duplicate SQL by hash, unverified
+  field bindings, circular dependencies via Tarjan SCC, complexity hotspots,
+  tables without relationships), **pinned tooltips**, and a **hierarchical
+  layout** toggle. The `<!-- EMBED_GRAPH_DATA -->` embed contract is unchanged,
+  so embedded and external-JSON viewing both keep working.
+
+### Changed
+
+- **`sql` node `origin` accumulates on dedupe.** When two or more objects share
+  identical SQL (same hash) they merge into one `sql` node and its `origin`
+  becomes a **list** of every place the statement appears; single-origin nodes
+  keep a plain string. This mirrors the PowerShell grapher and drives the new
+  "Duplicate Inline SQL" report. Both the viewer and `access_graph_query` handle
+  either shape, so this is a backward-compatible **`graph.json`** enrichment.
+
+### Notes
+
+- `rawSize` is the byte length (UTF-8) of the object's `SaveAsText` export and
+  is an **approximate logical size**: for forms and reports the binary print
+  sections (`PrtMip` / `PrtDevMode`) are stripped before measuring, so the
+  number reflects the design text rather than the on-disk object size.
+
 ## 0.7.46 — 2026-06-19
 
 Real design taste for `access_build_form` — three curated **design directions**

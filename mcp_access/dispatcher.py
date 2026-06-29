@@ -727,6 +727,7 @@ def call_tool_sync(name: str, arguments: dict) -> str:
                 include_macro_heuristics=bool(
                     arguments.get("include_macro_heuristics", True)),
                 embed_viewer=bool(arguments.get("embed_viewer", True)),
+                raw_export_mode=arguments.get("raw_export_mode", "none"),
             )
             text = json.dumps(result, ensure_ascii=False, indent=2)
 

@@ -260,7 +260,7 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 
 | Tool | Description |
 |------|-------------|
-| `access_graph` | Build a dependency graph of the entire database — tables, queries, forms, reports, macros, modules. Detects relationships, RecordSource, ControlSource, SourceObject, RowSource, VBA code heuristics, and macro actions. Outputs `graph.json` + interactive HTML viewer. Options: `field_mode` (none/referenced/all), `include_code_heuristics`, `include_macro_heuristics`, `embed_viewer` |
+| `access_graph` | Build a dependency graph of the entire database — tables, queries, forms, reports, macros, modules. Detects relationships, RecordSource, ControlSource, SourceObject, RowSource, VBA code heuristics, and macro actions. Outputs `graph.json` + an interactive HTML viewer with analytical reports (broken objects, orphans, inline-SQL inventory, linked tables, high fan-in, duplicate SQL, unverified field bindings, circular dependencies, complexity hotspots, tables without relationships). Nodes carry enriched meta (`sqlPath`, field `ownerId`/`ownerGroup`, query `connect`, `rawHash`/`rawSize`). Options: `field_mode` (none/referenced/all), `include_code_heuristics`, `include_macro_heuristics`, `embed_viewer`, `raw_export_mode` (none/debug — debug keeps raw `SaveAsText` exports under `<out>/raw/`) |
 | `access_graph_query` | Query a previously-generated graph without re-scanning the database. Actions: `neighbors` (connections to/from a node, depth 1-3), `impact` (transitive downstream dependents), `path` (shortest path between two nodes), `orphans` (nodes with no incoming edges), `summary` (stats + top-degree nodes). Loads `graph.json` from `access_graph` output |
 
 ### Cross-reference

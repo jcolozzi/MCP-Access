@@ -1478,7 +1478,11 @@ TOOLS = [
             "queries, forms, reports, macros, modules. Detects relationships, "
             "RecordSource, ControlSource, SourceObject, RowSource, VBA code "
             "heuristics (DoCmd.Open*, RunSQL, type refs, data refs), and "
-            "macro actions. Outputs graph.json + an interactive HTML viewer."
+            "macro actions. Outputs graph.json + an interactive HTML viewer "
+            "with analytical reports (broken objects, orphans, inline-SQL "
+            "inventory, linked tables, high fan-in, duplicate SQL, unverified "
+            "field bindings, circular dependencies, complexity hotspots, tables "
+            "without relationships)."
         ),
         inputSchema={
             "type": "object",
@@ -1511,6 +1515,12 @@ TOOLS = [
                     "type": "boolean",
                     "default": True,
                     "description": "Generate index.html with embedded graph viewer",
+                },
+                "raw_export_mode": {
+                    "type": "string",
+                    "enum": ["none", "debug"],
+                    "default": "none",
+                    "description": "none: compute rawHash/rawSize only (temp exports cleaned up). debug: also keep raw SaveAsText exports under <out>/raw/{forms,reports,queries,macros,modules}",
                 },
             },
             "required": ["db_path"],

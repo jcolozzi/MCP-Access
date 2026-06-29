@@ -164,6 +164,11 @@ class GraphBuilder:
         self.warnings: list[dict] = []
         self.field_mode = field_mode
 
+        # Raw SaveAsText export mode: "none" (compute rawHash/rawSize only)
+        # or "debug" (also keep raw exports under <out>/raw/<group>/).
+        self.raw_export_mode = "none"
+        self.raw_dir: str | None = None
+
         # Populated during scan; sorted desc by length for matching
         self._known_data_names: list[str] = []
 
@@ -241,6 +246,37 @@ class GraphBuilder:
             "meta": dict(meta) if meta else {},
         })
 
+    def _set_raw_meta(
+        self, node_id: str, text: str, group: str, name: str
+    ) -> None:
+        """Record rawHash/rawSize on a node from its SaveAsText export.
+
+        ``rawSize`` is the UTF-8 byte length of the export text Python already
+        reads — an approximate *logical* size (Access print sections PrtMip/
+        PrtDevMode are stripped by ac_get_code), suitable for the relative
+        "Complexity Hotspots" ranking. In ``raw_export_mode="debug"`` the raw
+        text is also kept under ``<out>/raw/<group>/<name>.txt`` and its path
+        recorded as ``rawPath``.
+        """
+        node = self.nodes.get(node_id)
+        if node is None:
+            return
+        raw_path: str | None = None
+        if self.raw_export_mode == "debug" and self.raw_dir:
+            group_dir = os.path.join(self.raw_dir, _RAW_SUBDIR.get(group, group))
+            try:
+                os.makedirs(group_dir, exist_ok=True)
+                raw_path = os.path.join(group_dir, f"{_safe_filename(name)}.txt")
+                with open(raw_path, "w", encoding="utf-8") as f:
+                    f.write(text)
+            except Exception:
+                raw_path = None
+        node["meta"].update({
+            "rawHash": _text_hash(text),
+            "rawSize": len(text.encode("utf-8")),
+            "rawPath": raw_path,
+        })
+
     # ── name resolution ─────────────────────────────────────────────────
 
     def _targets_for_name(
@@ -268,16 +304,26 @@ class GraphBuilder:
     def _ensure_sql_node(
         self, sql_text: str, origin: str, sql_dir: str | None = None
     ) -> str:
-        """Create or reuse a SQL node; returns node_id."""
+        """Create or reuse a SQL node; returns node_id.
+
+        On a cache hit the new ``origin`` is appended so a deduplicated SQL
+        node tracks every place the identical statement appears (drives the
+        "Duplicate Inline SQL" report). ``origin`` is therefore a string for
+        single-origin nodes and a list once two or more origins are merged.
+        """
         h = _text_hash(sql_text)
         if h in self._sql_cache:
-            return self._sql_cache[h]
+            cached_id = self._sql_cache[h]
+            self._merge_sql_origin(cached_id, origin)
+            return cached_id
 
         node_id = f"sql:{h[:20]}"
         preview = _preview(sql_text, 120)
+        sql_path = os.path.join(sql_dir, f"{h}.sql") if sql_dir else None
         self.add_node(node_id, f"SQL {h[:8]}", "sql", meta={
             "origin": origin,
             "sqlHash": h,
+            "sqlPath": sql_path,
             "sqlLength": len(sql_text),
             "preview": preview,
         })
@@ -289,6 +335,20 @@ class GraphBuilder:
         # Add reference edges from SQL node to known data names
         self._add_sql_reference_edges(sql_text, node_id, sql_dir)
         return node_id
+
+    def _merge_sql_origin(self, node_id: str, origin: str) -> None:
+        """Append ``origin`` to a deduplicated SQL node's origin (str -> list)."""
+        node = self.nodes.get(node_id)
+        if node is None:
+            return
+        current = node["meta"].get("origin")
+        if isinstance(current, list):
+            if origin not in current:
+                current.append(origin)
+        elif current is None:
+            node["meta"]["origin"] = origin
+        elif current != origin:
+            node["meta"]["origin"] = [current, origin]
 
     def _add_sql_reference_edges(
         self, sql_text: str, from_id: str, sql_dir: str | None = None
@@ -316,6 +376,8 @@ class GraphBuilder:
             return None
         node_id = f"field:{owner_group}:{owner_name}:{field_name}"
         self.add_node(node_id, field_name, "field", meta={
+            "ownerId": owner_id,
+            "ownerGroup": owner_group,
             "ownerName": owner_name,
             "fieldName": field_name,
             "verified": verified,
@@ -391,11 +453,17 @@ class GraphBuilder:
                 continue
             node_id = self._object_id("query", name)
             sql = ""
+            connect = ""
             try:
                 sql = qd.SQL or ""
             except Exception:
                 pass
+            try:
+                connect = qd.Connect or ""
+            except Exception:
+                pass
             self.add_node(node_id, name, "query", meta={
+                "connect": connect,
                 "sqlPreview": _preview(sql, 200),
                 "sqlHash": _text_hash(sql) if sql else "",
             }, is_data=True)
@@ -516,6 +584,8 @@ class GraphBuilder:
                 {"name": name, "group": group},
             )
             return
+
+        self._set_raw_meta(object_id, export_text, group, name)
 
         # --- RecordSource ---
         record_source = _extract_record_source(export_text)
@@ -835,6 +905,7 @@ class GraphBuilder:
             text = ac_get_code(db_path, "macro", macro_name)
         except Exception:
             return
+        self._set_raw_meta(macro_id, text, "macro", macro_name)
         lines = text.splitlines()
         i = 0
         while i < len(lines):
@@ -890,9 +961,30 @@ class GraphBuilder:
                 except Exception:
                     return
         if code:
+            self._set_raw_meta(node_id, code, "module", module_name)
             self._analyze_code_heuristics(
                 node_id, "module", module_name, code, sql_dir
             )
+
+    def export_raw_remaining(self, db_path: str, obj_list: dict) -> None:
+        """Debug-mode supplemental pass: ensure every UI/query object has raw
+        meta + a kept raw file, even when its heuristic pass was skipped.
+
+        Idempotent — objects already carrying ``rawHash`` (forms/reports, and
+        macros/modules analyzed with heuristics on) are left untouched; this
+        fills the gaps (queries always; macros/modules when heuristics off).
+        """
+        for group in ("query", "form", "report", "macro", "module"):
+            for name in obj_list.get(group, []):
+                node_id = self._object_id(group, name)
+                node = self.nodes.get(node_id)
+                if node is None or "rawHash" in node["meta"]:
+                    continue
+                try:
+                    text = ac_get_code(db_path, group, name)
+                except Exception:
+                    continue
+                self._set_raw_meta(node_id, text, group, name)
 
     # ── Phase 6: output ─────────────────────────────────────────────────
 
@@ -993,6 +1085,22 @@ def _is_likely_sql(text: str) -> bool:
 
 def _text_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+_RAW_SUBDIR = {
+    "form": "forms",
+    "report": "reports",
+    "query": "queries",
+    "macro": "macros",
+    "module": "modules",
+}
+
+
+def _safe_filename(name: str) -> str:
+    """Strip characters illegal in Windows filenames."""
+    if not name:
+        return "_"
+    return re.sub(r'[\\/:*?"<>|]', "_", name)
 
 
 def _preview(text: str, max_len: int = 120) -> str:
@@ -1098,6 +1206,7 @@ def ac_graph(
     include_code_heuristics: bool = True,
     include_macro_heuristics: bool = True,
     embed_viewer: bool = True,
+    raw_export_mode: str = "none",
 ) -> dict:
     """Build a dependency graph for the given Access database.
 
@@ -1113,7 +1222,15 @@ def ac_graph(
     sql_dir = os.path.join(out_dir, "sql")
     os.makedirs(sql_dir, exist_ok=True)
 
+    raw_export_mode = (raw_export_mode or "none").lower()
+    if raw_export_mode not in ("none", "debug"):
+        raw_export_mode = "none"
+
     gb = GraphBuilder(field_mode=field_mode)
+    gb.raw_export_mode = raw_export_mode
+    if raw_export_mode == "debug":
+        gb.raw_dir = os.path.join(out_dir, "raw")
+        os.makedirs(gb.raw_dir, exist_ok=True)
 
     # Phase 2: enumerate all objects → nodes
     gb.scan_tables(app, db)
@@ -1172,6 +1289,11 @@ def ac_graph(
                 gb.add_warning("ModuleCodeParseFailed",
                                f"Error analyzing module '{mod_name}': {exc}",
                                {"name": mod_name})
+
+    # Debug raw-export: keep raw files + rawHash/rawSize for every object,
+    # including those skipped above when heuristics were disabled.
+    if raw_export_mode == "debug":
+        gb.export_raw_remaining(db_path, obj_list)
 
     # Phase 6: output
     return gb.build_output(abs_db, out_dir, field_mode, embed_viewer)
