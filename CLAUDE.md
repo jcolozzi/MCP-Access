@@ -527,11 +527,41 @@ start (includes the blank/comment lines above); `body_line` is the
 - Type 119 (`acCustomControl`): pass `class_name` with ProgID (e.g. `Shell.Explorer.2`).
 - Type 128 (`acWebBrowser`): native control, no ActiveX needed.
 
+## Code-execution gate (v0.7.51, merged from upstream)
+
+`mcp_access/security.py` is the single source of truth for the opt-in gate that
+closes the three code-execution sinks (`access_run_vba`, `access_eval_vba`,
+`access_run_macro` — the last because a macro can carry a `RunCode` action).
+Controlled by env var **`MCP_ACCESS_ALLOW_CODE_EXEC`** (truthy = `1/true/yes/on`,
+case-insensitive), read on **every call** (not at import) so tests can
+`monkeypatch` it and import order is irrelevant.
+
+Two layers:
+1. **Advertise** — `server.list_tools()` omits the 3 tools when the gate is
+   closed (hygiene; the model never sees them).
+2. **Enforce** — `dispatcher.call_tool_sync` rejects a gated tool at dispatch
+   time (before touching COM), so a client that calls the name directly —
+   without seeing it advertised — is still refused.
+
+Tool count stays **69** (nothing removed, 3 gated). `_TOOL_SCHEMA_INDEX` is
+built from the full `TOOLS`, so `coerce_arguments` works for gated tools too —
+do NOT filter it.
+
+**Prompt-injection fix (v0.7.50, GHSA-9jp6-hph9-jm5f):** `server.get_prompt`
+sanitizes `db_path` via `_sanitize_db_path()` (strip control chars / newlines,
+cap at MAX_PATH, reflect the value inside backticks).
+
+**Critical DO NOTs for the gate:**
+- Do NOT remove the dispatch-time enforcement in `call_tool_sync` — the
+  advertise layer alone is bypassable (a client can call an unadvertised name).
+- Do NOT ever add an MCP tool that flips the gate on at runtime — an injection
+  could call it. Enabling is out-of-band (env var + server restart) by design.
+
 ## Critical DO NOTs
 
 - **Do NOT remove the `DispatchEx` fallback** in `_Session._launch()`. `_launch()` tries `GetActiveObject("Access.Application")` first to attach to a user's running Access (avoids spawning a second process); on failure it falls back to `DispatchEx`, which is required after `/decompile` kills to bypass stale ROT entries. Do NOT swap `DispatchEx` for `Dispatch` in the fallback — `Dispatch` latches onto the stale ROT entry.
 - **Do NOT call `cls._app.Quit()` unconditionally in `_decompile()` / `ac_decompile_compact()`**. Check `_Session._attached` first — when True we attached to the user's Access and must only `CloseCurrentDatabase()`, keeping the instance alive. Only when `_attached=False` (we spawned via `DispatchEx`) is `Quit(1)` safe. Same applies to the `atexit` handler `_Session.quit()`.
-- **Do NOT use `EnsureDispatch`** — it changes binding for all 67 tools and adds `gen_py` cache dependency.
+- **Do NOT use `EnsureDispatch`** — it changes binding for all 69 tools and adds `gen_py` cache dependency.
 - **Do NOT run `OpenCurrentDatabase` in a separate thread** — COM STA objects can only be used from the thread that created them.
 - **Do NOT call `CreateForm()` directly** — use `access_create_form` tool to avoid the "Save As" MsgBox.
 - **Do NOT change schemas to strict `"type": "integer"`** — MCP clients can't be trusted to send correct types.

@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.7.52
+
+Merges the upstream security hardening from unmateria (v0.7.50 + v0.7.51) into
+this graph-enabled fork, and exposes the v0.7.48 schema surface the fork already
+implemented. The dependency-graph feature (`access_graph` / `access_graph_query`)
+is fully preserved. Still **69 tools**.
+
+### Security
+
+- **Opt-in code-execution gate (upstream v0.7.51).** The three tools that can
+  run arbitrary VBA / `Shell` — `access_run_vba`, `access_eval_vba`,
+  `access_run_macro` — are now **disabled by default** and only enabled when the
+  operator sets `MCP_ACCESS_ALLOW_CODE_EXEC` (`1/true/yes/on`) in the server's
+  environment. Two layers: `list_tools()` hides them when closed, and
+  `dispatcher.call_tool_sync` refuses them at dispatch time (so a direct call is
+  still blocked). New module `mcp_access/security.py`; see `SECURITY.md`.
+- **Prompt-injection fix (upstream v0.7.50, GHSA-9jp6-hph9-jm5f).**
+  `server.get_prompt` now sanitizes `db_path` via `_sanitize_db_path()`: control
+  characters / newlines are stripped, the value is capped at `MAX_PATH` and
+  reflected inside backticks, so a crafted path can no longer inject extra
+  prompt instructions.
+
+### Added
+
+- **Schema surface for already-implemented params (upstream v0.7.48).** No new
+  tools — the input schemas now advertise options the fork already honored:
+  `full_lint` on `access_create_control`, `access_set_control_props` and
+  `access_set_multiple_controls`; `name` / `names_only` / `mask_password` on
+  `access_list_linked_tables`; and `refresh` on `access_relink_table` (with
+  `new_connect` no longer required when `refresh=true`).
+- Tests: `tests/test_code_exec_gate.py`, `tests/test_prompt_injection.py`.
+- `.gitignore`: ignore local `web/` and `INFORME_*.md`.
+
+### Preserved
+
+- The dependency-graph feature (`graph.py`, `graph_query.py`, `viewer.html`, the
+  graph tools, and the extra control-parse fields) plus the `viewer.html`
+  package-data entry are untouched.
+
 ## 0.7.50
 
 Ports the upgraded **dependency-graph** functionality from the PowerShell

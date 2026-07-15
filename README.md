@@ -4,7 +4,7 @@
 
 **Give any AI assistant full control over Microsoft Access databases.**
 
-Create forms, write VBA, design tables, manage controls, run queries, build relationships, and edit every corner of an `.accdb` — all through natural language. 67 tools that turn Access into something you can *talk to*.
+Create forms, write VBA, design tables, manage controls, run queries, build relationships, and edit every corner of an `.accdb` — all through natural language. 69 tools that turn Access into something you can *talk to*.
 
 No Access expertise required. Just describe what you want.
 
@@ -314,7 +314,19 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 5. access_ui_type(db, key="enter")  → press Enter
 6. access_screenshot(db)  → verify the result
 ```
+## Security
 
+- **Code-execution tools are gated (opt-in).** `access_run_vba`,
+  `access_eval_vba` and `access_run_macro` can run arbitrary VBA (and therefore
+  `Shell` OS commands), so they are **disabled by default**. To enable them, add
+  `MCP_ACCESS_ALLOW_CODE_EXEC=1` to this server's `env` block in your MCP client
+  config and **restart** the server (the variable is read at startup). While
+  disabled, the tools are hidden from the tool list *and* refused at call time.
+  See `SECURITY.md`.
+- **Prompt-injection hardening.** The workflow prompt sanitizes its `db_path`
+  argument (control characters / newlines stripped, length-capped, reflected in
+  backticks) so a crafted path cannot inject extra instructions
+  (GHSA-9jp6-hph9-jm5f).
 ## Notes
 
 - Access runs visible (`Visible = True`) so VBE COM access works correctly.
