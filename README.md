@@ -4,7 +4,7 @@
 
 **Give any AI assistant full control over Microsoft Access databases.**
 
-Create forms, write VBA, design tables, manage controls, run queries, build relationships, and edit every corner of an `.accdb` — all through natural language. 69 tools that turn Access into something you can *talk to*.
+Create forms, write VBA, design tables, manage controls, run queries, build relationships, and edit every corner of an `.accdb` — all through natural language. 70 tools that turn Access into something you can *talk to*.
 
 No Access expertise required. Just describe what you want.
 
@@ -86,7 +86,7 @@ Add to your MCP config file (`.mcp.json`, `mcp.json`, or client-specific setting
 
 Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 
-## Tools (69)
+## Tools (70)
 
 ### Database
 
@@ -128,8 +128,9 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 | `access_vbe_find` | Search text in ONE specific module. To search all modules at once, use `access_vbe_search_all` |
 | `access_vbe_search_all` | Search text across ALL modules/forms/reports in the database at once |
 | `access_vbe_replace_proc` | Replace a full procedure by name (auto-calculates line bounds). Strips misplaced `Option` lines, runs structural health check |
-| `access_vbe_patch_proc` | Surgical find/replace within a procedure. Whitespace-tolerant fallback matching + contextual error messages when patches fail |
+| `access_vbe_patch_proc` | Surgical find/replace within a procedure. **Atomic by default** (all-or-nothing — nothing is written if any patch fails to match), case-insensitive anchors (`match_case`), `require_unique` guard, and `(Declarations)` support. Whitespace-tolerant fallback matching + contextual error messages when patches fail |
 | `access_vbe_append` | Append code at the end of a module. Auto-strips `Option Explicit`/`Option Compare` to prevent misplacement |
+| `access_vbe_check_syntax` | Static structural check of the already-open VBA project (balanced If/For/Do/While/Select/With/Type/Enum blocks, code outside procedures, misplaced `Option`). Safe alternative to `access_compile_vba` (which decompiles first); not a compiler, so `ok=true` doesn't prove it compiles |
 
 ### Form & report controls
 
@@ -350,6 +351,22 @@ Compatible with any MCP-compliant client (Cursor, Windsurf, Continue, etc.).
 The MCP Python SDK (v1.26.0) has a catch-all `except Exception` in `mcp/shared/session.py` that swallows real errors and returns a generic `-32602` code with no detail. A local patch is applied to this machine that includes the actual exception and traceback in the error response. If you upgrade the `mcp` package, re-apply the patch — see `CLAUDE.md` for details.
 
 ## Changelog
+
+### v0.7.53 (fork) — 2026-07-23
+
+Merges upstream **v0.7.52** (VBE robustness) into this graph-enabled fork while
+preserving the dependency-graph tools. **70 tools.**
+
+- **New tool `access_vbe_check_syntax`** — static structural check of the
+  already-open VBA project (balanced blocks, code outside procedures, misplaced
+  `Option`). A safe alternative to `access_compile_vba`, which decompiles first
+  and can discard unsaved VBA. Not a compiler — `ok=true` doesn't prove it
+  compiles.
+- **`access_vbe_patch_proc` is now atomic by default** — all-or-nothing patching
+  (nothing is written if any patch fails), case-insensitive anchors
+  (`match_case`), a `require_unique` guard, and `(Declarations)` support.
+- Dependency graph (`access_graph` / `access_graph_query`) and the code-execution
+  gate are preserved.
 
 ### v0.7.49 — 2026-06-25
 

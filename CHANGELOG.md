@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.7.53
+
+Merges upstream unmateria **v0.7.52** (VBE robustness) into this graph-enabled
+fork. One new tool (`access_vbe_check_syntax`) and a hardened
+`access_vbe_patch_proc`; the dependency-graph feature is fully preserved. Fork is
+now **70 tools**.
+
+### Added
+
+- **`access_vbe_check_syntax`** (upstream v0.7.52) — static structural check of
+  the already-open VBA project (balanced `If`/`For`/`Do`/`While`/`Select`/`With`/
+  `Type`/`Enum` blocks, code outside a procedure, misplaced `Option` statements).
+  A safe alternative to `access_compile_vba`, which decompiles first and can
+  discard unsaved VBA. Not a compiler — `ok=true` does not prove it compiles.
+
+### Changed
+
+- **`access_vbe_patch_proc` is now atomic by default** (upstream v0.7.52): if any
+  patch fails to match, the module is left byte-for-byte unchanged (`atomic`,
+  default `true`). Anchors match **case-insensitively** by default (`match_case`,
+  default `false`) since the VBE rewrites casing; adds a `require_unique` guard
+  and `proc_name='(Declarations)'` support for the module declarations section.
+- Refreshed `mcp_access/vbe.py`, `compile.py`, `ui.py`, `tips.py` to the upstream
+  v0.7.52 state (atomic VBE patching, Unicode-safe length handling,
+  simulate-then-commit).
+
+### Preserved
+
+- The dependency-graph feature (`graph.py`, `graph_query.py`, `viewer.html`, the
+  graph tools/branches, extra control-parse fields) and the `viewer.html`
+  package-data entry are untouched.
+
 ## 0.7.52
 
 Merges the upstream security hardening from unmateria (v0.7.50 + v0.7.51) into

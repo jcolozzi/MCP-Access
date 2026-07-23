@@ -11,14 +11,14 @@ MCP server for reading and editing Microsoft Access databases (`.accdb`/`.mdb`) 
 - **Caches**: `_parsed_controls_cache` (control parsing) and `_Session._cm_cache` (CodeModule COM objects — live COM proxies). Both invalidated on DB switch, object modification, and design operations. There is **no** Python-side cache of VBE text: `_cm_all_code()` always reads via `cm.Lines(1, total)` so external edits (manual VBE edits, Ctrl+Z, add-ins) are picked up immediately. See issue #26 for the reason this cache was removed.
 - **Binary section handling**: `ac_get_code` strips PrtMip/PrtDevMode from form/report exports; `ac_set_code` restores them automatically before import.
 
-## Tools (69 total)
+## Tools (70 total)
 
 | Category | Tools |
 |----------|-------|
 | **Database** | `access_create_database`, `access_close` |
 | **Objects** | `access_list_objects`, `access_get_code`, `access_set_code`, `access_export_structure`, `access_delete_object`, `access_create_form`, `access_build_form`, `access_clone_object` |
 | **SQL/Tables** | `access_execute_sql`, `access_execute_batch`, `access_table_info`, `access_search_queries`, `access_search_data`, `access_create_table`, `access_alter_table` |
-| **VBE line-level** | `access_vbe_get_lines`, `access_vbe_get_proc`, `access_vbe_module_info`, `access_vbe_replace_lines`, `access_vbe_find`, `access_vbe_search_all`, `access_vbe_replace_proc`, `access_vbe_patch_proc`, `access_vbe_append` |
+| **VBE line-level** | `access_vbe_get_lines`, `access_vbe_get_proc`, `access_vbe_module_info`, `access_vbe_replace_lines`, `access_vbe_find`, `access_vbe_search_all`, `access_vbe_replace_proc`, `access_vbe_patch_proc`, `access_vbe_append`, `access_vbe_check_syntax` |
 | **Controls** | `access_list_controls`, `access_get_control`, `access_create_control`, `access_delete_control`, `access_set_control_props`, `access_set_multiple_controls`, `access_manage_tab_order` |
 | **UI lint** | `access_lint_form` |
 | **DB Properties** | `access_get_db_property`, `access_set_db_property`, `access_get_form_property`, `access_set_form_property` |
@@ -543,7 +543,7 @@ Two layers:
    time (before touching COM), so a client that calls the name directly —
    without seeing it advertised — is still refused.
 
-Tool count stays **69** (nothing removed, 3 gated). `_TOOL_SCHEMA_INDEX` is
+Tool count stays **70** (nothing removed, 3 gated). `_TOOL_SCHEMA_INDEX` is
 built from the full `TOOLS`, so `coerce_arguments` works for gated tools too —
 do NOT filter it.
 
@@ -561,7 +561,7 @@ cap at MAX_PATH, reflect the value inside backticks).
 
 - **Do NOT remove the `DispatchEx` fallback** in `_Session._launch()`. `_launch()` tries `GetActiveObject("Access.Application")` first to attach to a user's running Access (avoids spawning a second process); on failure it falls back to `DispatchEx`, which is required after `/decompile` kills to bypass stale ROT entries. Do NOT swap `DispatchEx` for `Dispatch` in the fallback — `Dispatch` latches onto the stale ROT entry.
 - **Do NOT call `cls._app.Quit()` unconditionally in `_decompile()` / `ac_decompile_compact()`**. Check `_Session._attached` first — when True we attached to the user's Access and must only `CloseCurrentDatabase()`, keeping the instance alive. Only when `_attached=False` (we spawned via `DispatchEx`) is `Quit(1)` safe. Same applies to the `atexit` handler `_Session.quit()`.
-- **Do NOT use `EnsureDispatch`** — it changes binding for all 69 tools and adds `gen_py` cache dependency.
+- **Do NOT use `EnsureDispatch`** — it changes binding for all 70 tools and adds `gen_py` cache dependency.
 - **Do NOT run `OpenCurrentDatabase` in a separate thread** — COM STA objects can only be used from the thread that created them.
 - **Do NOT call `CreateForm()` directly** — use `access_create_form` tool to avoid the "Save As" MsgBox.
 - **Do NOT change schemas to strict `"type": "integer"`** — MCP clients can't be trusted to send correct types.
