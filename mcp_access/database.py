@@ -11,6 +11,7 @@ from .core import (
     invalidate_all_caches,
 )
 from .constants import FIELD_TYPE_MAP, DB_AUTO_INCR_FIELD, DAO_FIELD_TYPE
+from .security import exclusive_open_enabled
 
 
 # ---------------------------------------------------------------------------
@@ -48,9 +49,13 @@ def ac_create_database(db_path: str) -> dict:
         raise FileExistsError(
             f"'{resolved}' already exists. Use access_execute_sql to modify it."
         )
-    # Ensure Access is running
+    # Ensure Access is running.  Passing the target keeps _launch from
+    # attaching to an Access instance that has a different database open —
+    # the CloseCurrentDatabase below would otherwise shut down the user's
+    # own work (issue #38).  The file does not exist yet, so a running
+    # instance can never match it: we always get our own process here.
     if _Session._app is None:
-        _Session._launch()
+        _Session._launch(resolved)
     app = _Session._app
     # Close any previously open DB
     if _Session._db_open is not None:
@@ -66,7 +71,13 @@ def ac_create_database(db_path: str) -> dict:
     # FIX: Close and reopen to ensure CurrentDb() works reliably
     try:
         app.CloseCurrentDatabase()
-        app.OpenCurrentDatabase(resolved)
+        # Honour MCP_ACCESS_EXCLUSIVE here too: _db_open is recorded below and
+        # connect() will not re-open a path it already holds, so a shared reopen
+        # would leave the whole session shared after a create.
+        if exclusive_open_enabled():
+            app.OpenCurrentDatabase(resolved, True)
+        else:
+            app.OpenCurrentDatabase(resolved)
     except Exception:
         pass  # If reopen fails, at least the file was created
     # Same post-open validation as _Session._switch(): never record _db_open

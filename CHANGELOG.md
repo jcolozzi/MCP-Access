@@ -1,5 +1,84 @@
 # Changelog
 
+## 0.7.60
+
+Merges upstream unmateria **v0.7.53 → v0.7.59** into this graph-enabled fork.
+No new tools upstream, so the fork stays at **70 tools** (68 upstream +
+`access_graph` + `access_graph_query`). The dependency-graph feature is fully
+preserved.
+
+### Added
+
+- **`MCP_ACCESS_SHIFT_BYPASS`** (upstream v0.7.53) — opt **out** of the global
+  SHIFT AutoExec bypass. Fails *open*: unset or unparseable keeps the bypass.
+  The SHIFT key-down is a global OS event, so every keystroke typed anywhere on
+  the machine during the hold arrives shifted. All three synthesis sites now go
+  through `core._press_shift_bypass()`.
+- **`view` on `access_screenshot`** (upstream v0.7.54) — `normal` (default),
+  `design`, `preview`, `datasheet`. `design` fires no `Form_Open`/`Form_Load`,
+  so it cannot block on login dialogs or Modal/PopUp forms.
+- **`MCP_ACCESS_EXCLUSIVE`** (upstream v0.7.55) — open the session's database
+  exclusively so design-lock work fails loudly instead of silently no-op'ing.
+  Off by default, fails *closed*, and the mode is **verified** against the lock
+  file rather than assumed (Access reports none of the failure modes).
+- **Shared-open advisory** (upstream v0.7.56) — with the exclusive switch off,
+  the call that opens a database already held by another Access session now
+  carries a warning naming the holders.
+- **`Tab` (123) is a recognised control type** (upstream v0.7.59) — added to
+  `CTRL_TYPE` *and* `CONTAINER_TYPES`. The second half is load-bearing: a
+  recognised non-container makes `_parse_controls` skip its whole block, which
+  would swallow every Page and every control on them. `access_list_controls`
+  now returns tab controls, and each Page carries its `parent`.
+- **`access_create_control` warns when a control lands on a tab by accident**
+  (upstream v0.7.59) — when the new control's rectangle falls inside a tab
+  control and `parent` was empty. Nothing is ever re-parented automatically.
+- Upstream test suites: `test_attach_policy.py`, `test_compile_trigger.py`,
+  `test_exclusive_gate.py`, `test_parse_controls.py`,
+  `test_shared_open_advisory.py`, `test_shift_bypass_gate.py`.
+
+### Fixed
+
+- **`access_compile_vba` no longer misreports a failed compile *trigger* as a
+  compile *error*** (upstream v0.7.53). A code pane of the current database's
+  project is activated first (`_ensure_code_pane`), the dirty-marking resolves
+  the project via `_get_vb_project` instead of `VBE.ActiveVBProject`, and the
+  trigger is a chain (VBE menu item → `RunCommand`).
+- **`access_delete_object` no longer wedges behind an invisible modal**
+  (upstream v0.7.53) — `RunCommand(280)` runs under a dialog watchdog, and a
+  dismissed dialog means the per-module `DoCmd.Save` fallback runs.
+- **`mcp` is pinned `>=1.0.0,<2`** (upstream v0.7.57) — the v2 SDK renamed
+  `Tool.inputSchema` and dropped the decorator API, so the server did not even
+  finish importing.
+- **The session no longer hijacks an Access instance holding a different
+  database** (upstream v0.7.58) — `_Session._launch()` reuses a running
+  instance only when it is idle or already holds the target path;
+  `access_create_database` passes its target so it always spawns its own.
+- **`access_get_control` no longer reports `control_type: -1`** (upstream
+  v0.7.59) — resolved from the `Begin <Type>` token via `CTRL_TYPE_BY_NAME`.
+- **The string `"-1"` no longer places controls at 1 twip** (upstream v0.7.59)
+  — `coerce_prop` maps `"-1"` to `True`, so the four geometry arguments of
+  `ac_create_control` and the `snap_to_grid` loop in `ac_set_control_props` now
+  use a dedicated numeric helper.
+- A database another process holds **exclusively** is reported as a lock
+  conflict instead of being diagnosed as a broken AutoExec (upstream v0.7.56).
+
+### Changed
+
+- `access_tips` gained `design_vbe` (injecting code rewrites the form-level
+  `Left/Top/Right/Bottom` + `Checksum` — that is the design *window*, not the
+  layout) and a `vbe` note on project-wide identifier casing; the `controls`
+  topic's control-type numbers were wrong and are fixed.
+- **The README no longer duplicates the release history** — it links here, as
+  upstream now does. The fork's graph documentation in the README is unchanged.
+- `.mcp.json` is no longer tracked; `.mcp.json.example` ships instead.
+
+### Preserved
+
+- `graph.py`, `graph_query.py`, `viewer.html`, the `access_graph` /
+  `access_graph_query` tool definitions and dispatcher branches, the extra
+  control-parse fields (`source_object`, `row_source`, `link_master_fields`,
+  `link_child_fields`) and the `viewer.html` package-data entry.
+
 ## 0.7.53
 
 Merges upstream unmateria **v0.7.52** (VBE robustness) into this graph-enabled

@@ -1,5 +1,21 @@
 # CLAUDE.md — mcp-access MCP Server
 
+## Done in v0.7.59 — the `NEXT-STEPS.md` safety nets
+
+Items 1, 3 and 4 are implemented; see the CHANGELOG. Item 2 (warn when writing
+code changes modules nobody touched) was **deliberately left as documentation**
+in `access_tips('vbe')`: fingerprinting every module before and after every write
+costs hundreds of COM round-trips to report damage that is already done and
+already visible in the git diff. The useful part was explaining the cause.
+
+## 🔴 THIS REPOSITORY IS PUBLIC (github.com/unmateria/MCP-Access)
+
+Everything committed here is published. **Nothing from any private project a
+maintainer happens to be working on goes in**: no machine names, IP addresses,
+paths, credentials, database or object names, and no sample data. Examples in docs
+and tests use invented names (`frmOrders`, `tabDetails`, `btPrint`). Check any file
+before committing it, including this one. See `SECURITY.md`.
+
 ## Overview
 
 MCP server for reading and editing Microsoft Access databases (`.accdb`/`.mdb`) via COM automation (pywin32). Runs as stdio MCP server. Entry point: `access_mcp_server.py`. Implementation: `mcp_access/` package (~7500 lines across 20 modules).
@@ -56,9 +72,13 @@ Begin Form
         Begin                <- container
             Begin Label      <- REAL CONTROL
             End
-            Begin Page       <- CONTAINER -- children re-scanned
+            Begin Tab        <- CONTAINER -- the TabControl itself
                 Begin        <- anonymous wrapper
-                    Begin ComboBox  <- child control (parent = Page)
+                    Begin Page          <- CONTAINER (parent = Tab)
+                        Begin           <- anonymous wrapper
+                            Begin ComboBox  <- child control (parent = Page)
+                            End
+                        End
                     End
                 End
             End
@@ -66,7 +86,28 @@ Begin Form
     End
 End Form
 ```
-**Container types** (`_CONTAINER_TYPES = {"Page", "OptionGroup"}`): re-scanned for child controls. Children get a `"parent"` field. `container_stack` tracks nesting.
+**Container types** (`CONTAINER_TYPES = {"Page", "OptionGroup", "Tab"}`): re-scanned for child controls. Children get a `"parent"` field (innermost container wins). `container_stack` tracks nesting.
+
+**The TabControl is `Begin Tab`** (not `TabCtl`), it is `CTRL_TYPE[123]`, and it
+MUST stay in `CONTAINER_TYPES`. The parser skips to the end of the block of any
+recognised type that is not a container, so listing `Tab` without making it a
+container swallows every `Page` inside it and every control on those pages — the
+v0.7.34 regression, re-armed. `tests/test_parse_controls.py` fails loudly if this
+is undone. Consequence of the nesting: a Page's `parent` is its tab control, and
+a control on a page has the Page as `parent` (the innermost container wins).
+
+**Child coordinates are section-absolute.** Measured on Access 2016: a control
+created with `parent="Page1"` at `left=1200` exports `Left =1200`, not an offset
+from the page. So a control's rectangle and its tab control's compare directly —
+which is what `lint.tab_parent_hint` relies on. (The `parent` check in
+`_rule_out_of_bounds` predates this measurement and stays as a conservative
+skip.)
+
+**`ControlType =` absent means "default", not unknown.** Since v0.7.59 the type
+falls back to `CTRL_TYPE_BY_NAME[<Begin token>]` instead of `-1`. For
+WebBrowser/Navigation* that map yields the **AcControlType** number
+`CreateControl` wants, which differs from the SaveAsText one — deliberate, it is
+the number that makes a `get_control` → `create_control` round-trip work.
 
 **Depth counter inside a control block must include `Property = Begin`** (e.g. `GUID = Begin`, `NameMap = Begin`, `ConditionalFormat = Begin`). These open multi-line blocks closed by their own `End`. If the parser only counts plain `Begin <Type>` it decrements depth on the closing `End` of the property block without ever incrementing — the control closes prematurely at the first such `End`, and any controls that follow inside a `Page` / `OptionGroup` are silently lost. Fixed in v0.7.34 (was: `re.match(r"^Begin\b", bl_s)` — now also matches `r"^\w+\s*=\s*Begin\s*$"`, mirroring the form-level loop).
 
@@ -109,7 +150,31 @@ A DB whose startup code closes it during the open (startup-form error path + `Al
 1. Write the implementation function (e.g. `ac_new_tool()`)
 2. Add a `types.Tool(...)` entry to the `TOOLS` list
 3. Add an `elif name == "access_new_tool":` branch in `call_tool()`
-4. Update the tool count in this CLAUDE.md and README.md
+4. Update the tool count — see the release checklist below, it lives in **five**
+   places and they drift
+
+## Release checklist (the docs drift, every time)
+
+The tool count and the version live in more places than you remember.
+
+**The README no longer keeps its own changelog** (removed in v0.7.53): it was a
+700-line duplicate of `CHANGELOG.md` that had to be updated in parallel and
+drifted every single release. It now just links to `CHANGELOG.md`. Do NOT
+re-add per-version entries there.
+
+- `CHANGELOG.md` — new `## 0.7.NN — date` entry at the top. This is the only
+  changelog.
+- `README.md` — **three** spots: the tagline count (line ~7), the `## Tools (N)`
+  heading, and the tool tables themselves.
+- `CLAUDE.md` — `## Tools (N total)` heading + the category table.
+- `pyproject.toml` — `version` **and** the `— N tools.` in `description`.
+  The description is baked into the published artifact and PyPI versions are
+  immutable, so a miss there can only be fixed in the NEXT release.
+- `server.json` — `version` appears **twice**.
+
+Then: commit, `git tag v0.7.NN`, `git push && git push --tags`. The tag push
+triggers `.github/workflows/publish.yml` (PyPI + MCP Registry). Check it landed
+with `gh run list --limit 3`.
 
 ## Office version autodetect (v0.7.36+)
 
@@ -281,7 +346,7 @@ numeric and the result is attached to mutations whether the model asks or not.
 `measure="auto"|"wizhook"|"heuristic"`. WizHook (`_measure_text_batch`) measures
 exact rendered width in ONE COM round-trip via a temp std module +
 `_invoke_app_run`. It REQUIRES a compiled VBA project (`Application.IsCompiled`);
-during active development the ERP project is usually uncompiled, so it fails and
+during active development a project is usually uncompiled, so it fails and
 falls back to the conservative heuristic (a `note` is added when `measure` was
 explicitly `wizhook`). The embedded lint always uses `heuristic` (fast, no Run
 dependency). Default everywhere leans on the heuristic for reliability.
@@ -396,10 +461,10 @@ Now `ac_set_code` detects VBA-only input (`_looks_like_vba_only`: no
 ac_create_form(db, "frmFoo")
 ac_create_control(db, "form", "frmFoo", "CommandButton",
                   {"left": 100, "top": 100, "width": 1500, "height": 400},
-                  control_name="btCerrar")  # NEW: top-level control_name
+                  control_name="btClose")  # NEW: top-level control_name
 ac_set_code(db, "form", "frmFoo",
             "Option Compare Database\nOption Explicit\n"
-            "Private Sub btCerrar_Click()\n"
+            "Private Sub btClose_Click()\n"
             "    DoCmd.Close acForm, Me.Name\n"
             "End Sub\n")  # routes via VBE, not LoadFromText
 ```
@@ -420,10 +485,10 @@ which Access rejects with `"Property 'CreateControl.Parent' can not be set"`
 
 ```
 ac_create_control(db, "form", "frmFoo", "CommandButton",
-                  {"Parent": "tabGestion",    # case-insensitive special key
+                  {"Parent": "pagGeneral",    # the PAGE name, not the tab control
                    "Left": 100, "Top": 100, "Width": 2000, "Height": 500,
-                   "Caption": "Acción", "OnClick": "[Event Procedure]"},
-                  control_name="btMiAccion")
+                   "Caption": "Print", "OnClick": "[Event Procedure]"},
+                  control_name="btPrint")
 ```
 
 If `Parent` doesn't refer to an existing TabControl Page (or other container
@@ -476,6 +541,227 @@ start (includes the blank/comment lines above); `body_line` is the
 `Sub`/`Function`/`Property` declaration line. Use `start_line` for whole-proc ops,
 `body_line` for body line-range edits.
 
+## VBE patching: atomic / case / (Declarations) (v0.7.52)
+
+Field requests from @TvanStiphout-Home, all tested against a real database
+before being filed. `_apply_patches` (`vbe.py`) is the pure, COM-free engine
+extracted from `ac_vbe_patch_proc`'s old inline loop.
+
+### The 4-tier match ladder — order is load-bearing
+1. literal, case-sensitive → 2. ws-normalized, case-sensitive →
+3. literal, case-insensitive → 4. ws-normalized, case-insensitive.
+Tiers 3–4 only run when `match_case=false` (the default).
+
+**ALL case-sensitive tiers run before ANY case-insensitive one.** That is what
+makes the change byte-for-byte backwards compatible: every call that succeeds
+today still lands on tier 1 or 2, exactly where it landed before. Interleaving
+them (e.g. putting literal-CI between 1 and 2) would silently relocate calls
+that currently succeed via the ws fallback. Do NOT reorder.
+
+Case-insensitive replacement **cannot use `str.replace`** (it is case-sensitive).
+It finds the index on a lowered copy and splices the ORIGINAL string by
+position, inserting the caller's replacement text with its casing untouched.
+
+### The Unicode length guard
+`'İ'.lower()` (U+0130) returns TWO characters, so offsets computed on the
+lowered copy no longer address the original — one such char in a comment would
+splice the replacement into the middle of a line. `_case_insensitive_safe()`
+checks `len(text.lower()) == len(text)` and the CI tiers are skipped (with a
+note) when it fails. `casefold()` is worse (`ß`→`ss`); do not "improve" this.
+
+### atomic is simulate-then-commit, NOT a pre-pass
+`atomic=true` (default) decides AFTER running the whole patch loop in memory and
+BEFORE any `DeleteLines`/`InsertLines`. A pre-pass validating every anchor
+against the ORIGINAL text would be wrong in both directions: patch 0 can destroy
+the anchor patch 3 cites (pre-pass says OK, real run half-writes) or create it
+(pre-pass rejects a valid batch). Because the simulation and the commit are the
+same single pass, divergence is structurally impossible.
+
+The ABORTED message MUST keep telling the caller to re-send the **entire** batch.
+A model that re-sends only the failed patches loses the ones that did match —
+that failure mode is worse than the partial write atomic exists to prevent.
+
+`require_unique` violations are collected into the same blocking list as
+not-founds, so the atomic gate covers both uniformly. Occurrence counting uses
+the same tier that produced the match, and reports absolute module line numbers
+(`base_line + offset`). Note that `match_case=false` makes `require_unique`
+*stricter* — a CI comparison can match more often than a CS one.
+
+### (Declarations) as a target
+`_is_declarations()` matches `"(declarations)"` case-insensitively after
+`.strip()`. Deliberately NOT triggered by `""` — `ac_vbe_find` already reads
+`""` as "the whole module".
+- `ac_vbe_patch_proc` / `ac_vbe_get_proc`: resolve to `start=1`,
+  `count=cm.CountOfDeclarationLines`, bypassing `_proc_bounds`.
+- `count == 0` raises an actionable error pointing at
+  `ac_vbe_replace_lines(start_line=1, count=0, ...)` — and it must, because
+  `cm.Lines(1, 0)` and `cm.DeleteLines(1, 0)` both raise in VBE.
+- `_strip_option_lines` is guarded by `not is_declarations and start > 5`. The
+  old `start > 5` alone happened to be false at `start=1`, but relying on that
+  coincidence would silently delete `Option Explicit` if the threshold ever moved.
+- The final message reads `CountOfDeclarationLines`, never `ProcCountLines`
+  (there is no proc; the bare `except` would report a bogus `0`).
+- `ac_vbe_replace_proc` REFUSES `(Declarations)`: `new_code=""` would wipe
+  `Option Explicit` plus every module-level `Const` in one unconfirmed call.
+- `ac_vbe_module_info` gained an additive `declarations: {start_line, count}`.
+
+### The off-by-one: cm.CountOfLines is the source of truth
+`patch_proc` reported `cm.CountOfLines`; `module_info`/`get_lines` reported
+`len(splitlines())`. VBE emits no trailing terminator, so a module ending in a
+blank line makes `splitlines()` drop it → the two disagreed by exactly 1.
+
+`_cm_lines_list()` splits and then **pads with `""` up to `cm.CountOfLines`**, so
+`len(lines) == cm.CountOfLines` by construction. Every existing slice and bounds
+check keeps working, the reported number becomes authoritative, and a trailing
+blank line becomes readable via `get_lines` (it was rejected as out-of-range).
+
+**Do NOT "fix" this the other way round** by switching `patch_proc` to
+`splitlines()`. Its `count = min(count, total - start + 1)` is the clamp feeding
+a destructive `DeleteLines`; changing that input to a 1-short value to make a
+cosmetic message agree turns a display bug into code loss.
+
+Related: `new_count` is now clamped like `replace_proc` does, and
+`_check_module_health` receives `expected_total = total - count +
+_vbe_line_count(inserted)` so its Check 3 stops being dead code.
+`_vbe_line_count` counts a trailing CRLF as opening a further empty line —
+`"a\r\nb\r\n"` → 3 — because that is what `InsertLines` does.
+
+## access_vbe_check_syntax (v0.7.52)
+
+The safe alternative to `access_compile_vba`, which is unusable as a post-edit
+check: its step 0 calls `_Session._decompile` → a `MSACCESS.EXE /decompile`
+subprocess, then either `Quit(1)` (= acQuitSaveNone) or `CloseCurrentDatabase()`
+on the user's instance. **Unsaved VBA is discarded.** That stays as-is; the new
+tool simply never goes near it.
+
+Checks the ALREADY OPEN project: no decompile, no `RunCommand`, no Design view,
+no second Access instance. Reuses the pure validators in `compile.py`
+(`_check_blocks_in_module`, plus `_check_structure_in_module` extracted from
+`_verify_module_structure` in this release) — `ac_compile_vba`'s behaviour is
+unchanged, its wrappers just delegate now.
+
+- Uses `_get_vb_project(app)`, **not** `VBE.ActiveVBProject`: the active project
+  can be `acwzmain` (the wizard library) after a decompile/compact.
+- Feeds the checkers `code.split("\n")`, not `splitlines()` — they were written
+  against raw VBE text and their `" _"` continuation test sees the stray `\r`.
+- **Never reports a clean 0 for something it could not read.** Per-module
+  failures land in `skipped` and force `ok=false`; a project that fails to
+  enumerate raises. Same rule as the multi-object scans.
+- The `note` field states plainly that this is structural validation, not
+  compilation: no identifier resolution, no type checking, no references. A
+  caller who reads `ok=true` as "it compiles" is the failure mode to avoid.
+
+`_check_structure_in_module` also gained an end-of-module check for an unclosed
+`Type`/`Enum` block — everything below the opener is absorbed by it, so no line
+inside the loop could ever have flagged it (the "Statement invalid inside Type
+block" trap already documented under VBA Language Gotchas).
+
+## access_compile_vba trigger hardening (v0.7.53, PR #35)
+
+`ac_compile_vba` reads `Application.IsCompiled` as its success signal after
+**deliberately dirtying the project** (step 0b) — so any path where the
+Debug > Compile trigger silently fails leaves `IsCompiled=False` and used to be
+misreported as a compile error in the user's code ("missing reference,
+undeclared variable, or type mismatch") while manual Debug > Compile succeeded.
+
+- **`_ensure_code_pane(app)`** runs before the trigger: makes a code pane of the
+  CURRENT database's project active. Debug > Compile acts on the ACTIVE project
+  and is only reliably enabled with a code pane focused; after a
+  decompile/compact the active project is often `acwzmain`. Do NOT remove this
+  step — without it `Execute()` raises DISP_E_EXCEPTION, no-ops, or compiles the
+  wizard library. It short-circuits when a pane of our project is already
+  active: re-`Show()`ing on every compile piles code windows into the user's VBE
+  and costs a COM round-trip per component on a large project.
+- Step 0b uses `_get_vb_project`, NOT `VBE.ActiveVBProject` — same wrong-project
+  reasoning as `access_vbe_check_syntax`.
+- **The trigger is a chain**, not an if/else: VBE menu item (unless Access
+  reports `Enabled=False`) → `RunCommand(AC_CMD_COMPILE)`. The menu item is
+  first because `RunCommand(126)` silently skips form/report modules. Keep the
+  menu item first if you touch this.
+- **`if dismissed: break` inside the chain is load-bearing.** A real compile
+  error surfaces as a dialog; the watchdog dismisses it and `Execute()` can then
+  raise as a side effect. Without the break we would re-fire the compile and,
+  worse, report "command unavailable" for what is a genuine code error — the
+  exact false alarm inverted. A trigger exception with a dismissed dialog must
+  fall through to step 4.
+- All triggers failed + no dialog ⇒ "could not run the compile command" (NOT a
+  code error). `IsCompiled=False` with no dialog and no block mismatches ⇒ the
+  message states BOTH possible causes and says to cross-check manually. Both
+  carry `trigger` + `code_pane` diagnostics. Do NOT restore the old
+  unconditional "missing reference…" wording — it was a repeated field false
+  alarm.
+
+`_save_all_modules` (`code.py`) runs `RunCommand(280)` under a dialog watchdog:
+when Access is not foreground (VBE has focus, e.g. right after a compile
+activated a code pane) "not available now" arrives as a MODAL dialog instead of
+a trappable 2046, wedging `ac_delete_object`. `ran_ok and not dismissed` is the
+success test — a dismissed dialog means the command never ran, so the per-module
+`DoCmd.Save` loop must still execute. The watchdog waits `_SAVE_MODULES_GRACE`
+(1.5 s) before dismissing anything: a working RunCommand returns in
+milliseconds, so this keeps the attached-instance policy intact (a modal with
+nothing blocking belongs to the interactive user). The `join()` before reading
+`dismissed` is also load-bearing — dismissing the dialog is what unblocks the
+COM call, so the main thread can otherwise win the race.
+
+## SHIFT AutoExec bypass opt-out (v0.7.53, PR #34)
+
+`security.shift_bypass_enabled()` gates the synthetic SHIFT hold behind
+**`MCP_ACCESS_SHIFT_BYPASS`**. `keybd_event` is a global key-down: it shifts
+whatever the human types anywhere on the machine while held (~0.3 s per open,
+~3 s per decompile).
+
+**Opposite polarity to the code-exec gate, on purpose.** That one is security
+and fails CLOSED (only an explicit truthy value opens it). This one is
+ergonomics and fails OPEN (only an explicit `0/false/no/off` disables it), so a
+typo can't quietly let AutoExec run on someone's database. Hence no `ALLOW_`
+prefix (implies default-off) and no `DISABLE_` (double negative). Do NOT flip
+the default: turning the bypass off for everyone would change behaviour with no
+error message pointing at the cause.
+
+**`core._press_shift_bypass()` is the only place in the package that presses
+SHIFT** (`core._release_shift()`, the pre-existing `atexit` safety net, releases
+it — idempotent, so callers just guard with their own `shift_held` flag). The
+three call sites (`_switch`, `_Session._decompile`,
+`maintenance.ac_decompile_compact`) each carried their own copy before v0.7.53,
+which is exactly how a gate gets half-applied. `test_shift_bypass_gate.py` fails
+if `keybd_event` reappears outside `core.py`. (`ui.py` legitimately synthesises
+keys for `access_ui_type` and is excluded.)
+
+## Code-execution gate (v0.7.51)
+
+`mcp_access/security.py` is the single source of truth for the opt-in gate that
+closes the three code-execution sinks (`access_run_vba`, `access_eval_vba`,
+`access_run_macro` — the last one because a macro can carry a `RunCode` action).
+Controlled by the env var **`MCP_ACCESS_ALLOW_CODE_EXEC`** (truthy = `1/true/yes/on`,
+case-insensitive, `.strip()`), read on **every call** (not at import) so tests can
+`monkeypatch` it and import order is irrelevant.
+
+Two layers:
+1. **Advertise** — `server.list_tools()` omits the 3 tools when the gate is closed
+   (hygiene; the model never sees them).
+2. **Dispatch** — `dispatcher.call_tool_sync` rejects a gated tool *first thing in
+   the `try`*, before any `_Session`/COM, returning `code_exec_denied_message`.
+   This is the REAL barrier: a client can call the name directly without seeing it
+   advertised.
+
+Rationale: `confirm_*` flags stop model mistakes, not injection (injected text can
+ask for `confirm=true`). Only an out-of-band env var the model can't set defends
+against prompt injection. See `SECURITY.md`. Tool count stays 67 (nothing removed,
+3 gated). `_TOOL_SCHEMA_INDEX` is still built from the full `TOOLS` so
+`coerce_arguments` works for gated tools too — do NOT filter it.
+
+**Enable-on-request flow** (documented, NOT a tool): when the *user explicitly asks*
+to enable VBA exec, warn what it grants (arbitrary OS commands via `Shell`, treat DB
+as untrusted, trusted DBs only), edit the `env` block of this server in the MCP
+client config (e.g. `.mcp.json`) to add `"MCP_ACCESS_ALLOW_CODE_EXEC": "1"`, and tell
+the user to **restart** the server (the var is read at startup).
+
+**Critical DO NOTs for the gate:**
+- Do NOT remove the dispatch-time enforcement in `call_tool_sync`. The advertise
+  layer alone is bypassable (a client can call an unadvertised name directly).
+- Do NOT ever add an MCP tool that flips the gate on at runtime. An injection would
+  call it. Enabling MUST stay out of band (edit config + restart).
+
 ## Common Gotchas
 
 - VBE line numbers are **1-based**
@@ -493,6 +779,42 @@ start (includes the blank/comment lines above); `body_line` is the
 - `_switch()` holds Shift key during `OpenCurrentDatabase` (standard Access bypass). Auto-opened forms are closed as safety net.
 - `AutomationSecurity = 3` is set as defence-in-depth but does NOT suppress AutoExec macro objects (tested).
 - `_Session.reopen(path)` always applies SHIFT bypass.
+
+### Exclusive opens are a request, not a guarantee (v0.7.55)
+`MCP_ACCESS_EXCLUSIVE` (off by default, fails closed) passes `Exclusive:=True`
+as the 2nd positional arg of `OpenCurrentDatabase(filepath, Exclusive,
+bstrPassword)`. Access reports **none** of the failure modes, so `_switch()`
+verifies instead of trusting (measured on Access 2016):
+- file free -> exclusive, and **no lock file is written**;
+- file already open -> opened **shared**, no exception, `CurrentDb` valid, our
+  entry appended to the lock file;
+- file held exclusively by another -> no exception, session left with **no
+  database** (this is what reaches the existing `CurrentDb() is None` check —
+  in exclusive mode it must NOT blame AutoExec).
+
+Hence `_lock_file_in_use()` before the open (refuse, session untouched) and
+again after (downgrade -> `CloseCurrentDatabase`). Existence of `.laccdb` alone
+proves nothing: an orphan from a crashed Access stays on disk and Access opens
+exclusively over it, so the file is probed with `CreateFileW(dwShareMode=0)` —
+`ERROR_SHARING_VIOLATION` means a live session. Holder names come from its
+64-byte entries (32 computer + 32 security name).
+
+### Shared opens warn, never refuse (v0.7.56)
+The lock check in `_switch` also runs with the switch OFF, but only parks
+`_Session._shared_open_warning = (monotonic, msg)`; `server.call_tool` appends
+it, same timestamp gate as `_last_dismissed`. Keep it a warning — refusing is
+the env var's job and a default-on refusal breaks every shared workflow.
+- Read the lock file BEFORE closing/opening anything: after the open, our own
+  entry is in it.
+- Skipped when `_already_open(path)` — an attached instance holding the file
+  would otherwise report the user to themselves.
+
+`_db_file_in_use()` probes the `.accdb` itself with `dwShareMode=0` because
+`_lock_file_in_use` sees SHARED occupants only: a database held **exclusively**
+by another process writes NO lock file. That open leaves the session with no
+database and no exception, so it lands in the post-open `CurrentDb() is None`
+check — where it must NOT blame AutoExec. The probe runs first, the AutoExec
+message is the fallback. Valid only after our own session is torn down.
 
 ### Linked tables and dbAttachSavePWD
 - `dbAttachSavePWD` = **131072** (0x20000), NOT 65536.
@@ -559,7 +881,7 @@ cap at MAX_PATH, reflect the value inside backticks).
 
 ## Critical DO NOTs
 
-- **Do NOT remove the `DispatchEx` fallback** in `_Session._launch()`. `_launch()` tries `GetActiveObject("Access.Application")` first to attach to a user's running Access (avoids spawning a second process); on failure it falls back to `DispatchEx`, which is required after `/decompile` kills to bypass stale ROT entries. Do NOT swap `DispatchEx` for `Dispatch` in the fallback — `Dispatch` latches onto the stale ROT entry.
+- **Do NOT remove the `DispatchEx` fallback** in `_Session._launch()`. `_launch(target_path)` tries `GetActiveObject("Access.Application")` first, but the attach is **conditional** (v0.7.58, issue #38): it keeps the candidate only when that instance is idle (`CurrentDb()` is None) or already holds `target_path` (`os.path.normcase` comparison, like `_already_open`). An instance with a **different** database open is dropped — attaching to it means `ac_create_database`'s `CloseCurrentDatabase()` shuts down the user's own work, which is how @Access-Abraxas' VBA killed the very code calling this server. `target_path=None` keeps the historical attach-anything behaviour for callers with no destination. Known limitation: `GetActiveObject` returns one ROT entry, so with several Access windows open we may spawn a process even though another window had the target open. Do NOT "fix" this by marking who opened the database and leaving a foreign one alone in `_switch` — we would then reopen it shared later, with the v0.7.56 lock warning and design-lock conflicts. Everything else is unchanged: the fallback is `DispatchEx`, required after `/decompile` kills to bypass stale ROT entries. Do NOT swap `DispatchEx` for `Dispatch` in the fallback — `Dispatch` latches onto the stale ROT entry. Under `MCP_ACCESS_EXCLUSIVE` the attach is skipped entirely (a running instance holds the file shared) and `DispatchEx` is the only path — do NOT "restore" attaching there.
 - **Do NOT call `cls._app.Quit()` unconditionally in `_decompile()` / `ac_decompile_compact()`**. Check `_Session._attached` first — when True we attached to the user's Access and must only `CloseCurrentDatabase()`, keeping the instance alive. Only when `_attached=False` (we spawned via `DispatchEx`) is `Quit(1)` safe. Same applies to the `atexit` handler `_Session.quit()`.
 - **Do NOT use `EnsureDispatch`** — it changes binding for all 70 tools and adds `gen_py` cache dependency.
 - **Do NOT run `OpenCurrentDatabase` in a separate thread** — COM STA objects can only be used from the thread that created them.
@@ -567,6 +889,31 @@ cap at MAX_PATH, reflect the value inside backticks).
 - **Do NOT change schemas to strict `"type": "integer"`** — MCP clients can't be trusted to send correct types.
 - **Do NOT auto-decompile on DB open** — only on first compile. Auto-decompile on open caused SHIFT key stuck issues and process accumulation on MCP reconnect.
 
+## The `mcp<2` pin (v0.7.57)
+
+`pyproject.toml` pins `mcp>=1.0.0,<2`. **Do NOT drop the upper bound** unless
+the v2 migration lands in the same change. Without it a clean `pip`/`uvx`
+install resolves to the v2 SDK and the package never finishes importing:
+`tools.py` reads `_tool.inputSchema`, and v2 renamed the field to
+`input_schema` (constructing with `inputSchema=` still works through the
+camelCase alias; reading it back does not).
+
+What v2 changes here, verified against a clean 2.1.1 install:
+- the four `@server.*` decorators are gone. The low-level `Server` takes
+  `on_list_tools` / `on_call_tool` / `on_list_prompts` / `on_get_prompt`
+  constructor callbacks with `(context, params)` signatures, returning the
+  `ListToolsResult` / `CallToolResult` / `ListPromptsResult` wrappers;
+- `mcp.shared.session` no longer exists, so the local patch described below
+  has no target there;
+- `stdio_server` and `create_initialization_options` are unchanged.
+
+Migration is tracked in issue #37 and deferred on purpose. v2 serves both
+protocol eras from one server, so it would break no client, but 1.x still
+receives security fixes and this server uses nothing v2 adds (stdio only, no
+auth, no HTTP, no extensions). Revisit when a client requires the 2026-07-28
+protocol revision (the 1.x SDK tops out at 2025-11-25), or when a security fix
+is not backported to the `v1.x` branch.
+
 ## MCP SDK Patch (local to this machine)
 
-The MCP Python SDK (`mcp/shared/session.py`) swallows all exceptions with a generic `-32602` error. A local patch at `c:\program files\python310\lib\site-packages\mcp\shared\session.py` adds full traceback to `ErrorData.message` and `ErrorData.data`. Re-apply after `pip install --upgrade mcp`.
+The MCP Python SDK (`mcp/shared/session.py`) swallows all exceptions with a generic `-32602` error. A local patch at `<python>\Lib\site-packages\mcp\shared\session.py` adds full traceback to `ErrorData.message` and `ErrorData.data`. Re-apply after `pip install --upgrade mcp`.

@@ -1098,7 +1098,7 @@ TOOLS = [
                 "db_path": {"type": "string", "description": "Path to .accdb/.mdb file"},
                 "expression": {
                     "type": "string",
-                    "description": "Expression to evaluate (e.g.: 'Forms!frmX.MARGEN_SEG', 'Date()', 'DLookup(\"Empresa\",\"Ventas\",\"numc=1\")')",
+                    "description": "Expression to evaluate (e.g.: 'Forms!frmOrders.Total', 'Date()', 'DLookup(\"Name\",\"Customers\",\"ID=1\")')",
                 },
                 "timeout": {
                     "type": "integer",
@@ -1368,11 +1368,11 @@ TOOLS = [
     # -- Tips / knowledge base -----------------------------------------------
     types.Tool(
         name="access_tips",
-        description="Tips and gotchas for working with Access via MCP. Topics: eval, controls, gotchas, sql, vbe, compile, design, lint, macros, subform_tabcontrol. Without topic returns the list.",
+        description="Tips and gotchas for working with Access via MCP. Topics: eval, controls, gotchas, sql, vbe, compile, design_vbe, macros, lint, layout, design, subform_tabcontrol. Without topic returns the list.",
         inputSchema={
             "type": "object",
             "properties": {
-                "topic": {"type": "string", "description": "Topic: eval, controls, gotchas, sql, vbe, compile, design (empty = list of topics)"},
+                "topic": {"type": "string", "description": "Topic name, or empty for the list of topics"},
             },
         },
     ),
@@ -1411,6 +1411,12 @@ TOOLS = [
                     "type": "integer",
                     "default": 30,
                     "description": "Max seconds waiting for OpenForm/OpenReport. If Form_Load takes longer (slow OpenRecordset), ESC is sent and error is raised. Default 30.",
+                },
+                "view": {
+                    "type": "string",
+                    "enum": ["normal", "design", "preview", "datasheet"],
+                    "default": "normal",
+                    "description": "View mode: 'normal' (default, fires events), 'design' (no events fire, safe for Modal/PopUp forms), 'preview' (print preview), 'datasheet'.",
                 },
             },
             "required": ["db_path"],
