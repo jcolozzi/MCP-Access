@@ -318,7 +318,7 @@ Pure-Python tool that loads `graph.json` and answers targeted questions without 
 |--------|---------|------------|
 | `summary` | Node/edge counts, top edge kinds, highest-degree nodes | `group` filter |
 | `neighbors` | Direct connections to/from a node (BFS depth 1-3) | `node`, `depth`, `direction` (in/out/both) |
-| `impact` | Transitive downstream walk — what breaks if this changes | `node` |
+| `impact` | Transitive dependents — what breaks if this changes. Walks edges backwards (they point consumer → dependency) and descends through a table/query's field nodes; each hit has `depth` | `node` |
 | `path` | Shortest path between two nodes (undirected BFS) | `source`, `target` |
 | `orphans` | Nodes with zero incoming edges (dead objects) | — |
 

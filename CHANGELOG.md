@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.7.65
+
+**The dependency graph answered "what breaks?" backwards.** Fork-only fixes to
+`access_graph` / `access_graph_query`, found in a code review of how useful the
+graph is to an agent about to edit a database. No new tools (still **71**).
+
+### Fixed
+
+- **`impact` returned dependencies, not dependents.** Edges point consumer →
+  dependency (form → query → table), but `impact` followed them forwards, so
+  `impact("Customers")` came back empty while every query and form using the
+  table was ignored — and `impact` of a form listed what the form *uses*. It now
+  walks edges backwards, descends through a table/query's field nodes so
+  controls bound to its fields are found, and reports a `depth` per hit.
+  `impact` on a field node does not climb to its owner. For the old
+  what-does-this-use view, use `neighbors` with `direction="out"`.
+- **Long `RecordSource` values were truncated.** `_extract_record_source` used
+  its own single-line regex, so a SQL RecordSource that `SaveAsText` wrapped at
+  80 characters produced a partial SQL node and missed table edges. It now uses
+  `helpers.join_wrapped_value` like the control parser, which also keeps a
+  value's own closing quote.
+- **The HTML viewer could run script from database content.** Graph JSON was
+  embedded in a `<script>` block unescaped, so any SQL, caption or string
+  literal containing `</script>` closed the tag. Every `<` in the embedded JSON
+  is now written as `\u003c`.
+- **Query results dropped what an agent needs to act.** Edges now carry their
+  `meta` (control name, procedure, relationship fields, …), and nodes expose
+  `preview` / `origin` / `ownerId` — SQL nodes used to show only `SQL 3fa9c2e1`
+  because the formatter looked for the wrong key.
+- **`summary(group=...)` applied the filter after taking the top 15**, often
+  returning few or no nodes.
+- **A name shared by two groups resolved silently to the first one** (a table
+  and a form both called `Customers` picked the table). It is now reported as
+  ambiguous with the full ids to choose from.
+
+### Added
+
+- `tests/test_graph.py` — 16 pure tests, no COM. 11 of them fail on 0.7.64.
+- The `access_graph_query` description now says to run `impact` before a
+  rename/delete and that the graph must be regenerated after edits.
+
 ## 0.7.64
 
 Merges upstream unmateria **v0.7.60 → v0.7.63** into this graph-enabled fork.

@@ -25,7 +25,7 @@ from .code import ac_get_code, ac_list_objects
 from .constants import CTRL_TYPE, DAO_FIELD_TYPE
 from .controls import _get_parsed_controls
 from .core import _Session
-from .helpers import split_code_behind
+from .helpers import join_wrapped_value, split_code_behind
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -35,9 +35,7 @@ _SQL_START_RE = re.compile(
     r"^\s*(SELECT|INSERT|UPDATE|DELETE|TRANSFORM|PARAMETERS|WITH)\b", re.I
 )
 
-_RECORDSOURCE_RE = re.compile(
-    r"^\s+RecordSource\s*=\s*\"?(.*?)\"?\s*$", re.M
-)
+_RECORDSOURCE_RE = re.compile(r"^\s+RecordSource\s*=\s*(.*?)\s*$")
 
 # VBA DoCmd / QueryDefs patterns  (case-insensitive, dot-all)
 _VBA_PATTERNS: list[dict[str, str]] = [
@@ -1049,7 +1047,10 @@ class GraphBuilder:
         if not viewer_src.exists():
             return None
         template = viewer_src.read_text(encoding="utf-8")
-        graph_json = json.dumps(graph, ensure_ascii=False, default=str)
+        # Database text is untrusted: a literal "</script>" would end the tag.
+        graph_json = json.dumps(
+            graph, ensure_ascii=False, default=str
+        ).replace("<", "\\u003c")
         embed_script = f"\n<script>var EMBEDDED_GRAPH = {graph_json};</script>\n"
         marker = "<!-- EMBED_GRAPH_DATA -->"
         if marker in template:
@@ -1135,11 +1136,13 @@ def _extract_record_source(export_text: str) -> str | None:
     cutoff = export_text.find("Begin Section")
     if cutoff < 0:
         cutoff = len(export_text)
-    header = export_text[:cutoff]
-    m = _RECORDSOURCE_RE.search(header)
-    if m:
-        val = m.group(1).strip()
-        return val if val else None
+    lines = export_text[:cutoff].splitlines()
+    for i, line in enumerate(lines):
+        m = _RECORDSOURCE_RE.match(line)
+        if m:
+            val, _ = join_wrapped_value(lines, i, m.group(1))
+            val = val.strip()
+            return val if val else None
     return None
 
 

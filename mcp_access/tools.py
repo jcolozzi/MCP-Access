@@ -1704,10 +1704,13 @@ TOOLS = [
         description=(
             "Query a previously-generated Access dependency graph without "
             "re-scanning the database. Actions: neighbors (direct connections), "
-            "impact (transitive downstream dependents), path (shortest path "
+            "impact (transitive dependents — every object that uses the node, "
+            "with depth; run it BEFORE renaming, deleting or changing a table, "
+            "query, field, form or module), path (shortest path "
             "between two nodes), orphans (nodes with no incoming edges), "
             "summary (stats + top-degree nodes). Loads graph.json from "
-            "access_graph output."
+            "access_graph output; re-run access_graph after edits, it does not "
+            "refresh itself."
         ),
         inputSchema={
             "type": "object",
@@ -1755,7 +1758,7 @@ TOOLS = [
                 "skip_fields": {
                     "type": "boolean",
                     "default": True,
-                    "description": "Exclude field-owner edges from results (reduces noise)",
+                    "description": "Exclude field nodes from results (reduces noise). impact still walks through a table/query's fields to find controls bound to them",
                 },
             },
             "required": ["action"],

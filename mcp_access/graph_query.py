@@ -3,7 +3,7 @@ graph_query.py — Query an Access dependency graph without re-scanning.
 
 Loads a previously-generated graph.json and supports targeted queries:
   neighbors  — direct connections to/from a node (depth 1-3)
-  impact     — transitive downstream dependents (what breaks if this changes)
+  impact     — transitive dependents (everything that uses this node)
   path       — shortest path between two nodes
   orphans    — nodes with zero incoming edges
   summary    — high-level stats, top edge kinds, high-degree nodes
@@ -61,13 +61,16 @@ class _Graph:
         if low in self._id_lookup:
             return [self._id_lookup[low]]
 
-        # 2. Try group:name for all groups
+        # 2. Try group:name for all groups — a form and a table may share a name
         _GROUPS = ("table", "query", "form", "report", "macro",
                    "module", "field", "sql")
-        for g in _GROUPS:
-            candidate = f"{g}:{name}".lower()
-            if candidate in self._id_lookup:
-                return [self._id_lookup[candidate]]
+        group_hits = [
+            self._id_lookup[f"{g}:{name}".lower()]
+            for g in _GROUPS
+            if f"{g}:{name}".lower() in self._id_lookup
+        ]
+        if group_hits:
+            return group_hits
 
         # 3. Label match (case-insensitive)
         hits = self._label_lookup.get(low, [])
@@ -104,23 +107,28 @@ def _load_graph(graph_path: str | None, db_path: str | None) -> _Graph:
 # Compact edge/node formatters
 # ---------------------------------------------------------------------------
 
+_NODE_META_KEYS = ("preview", "sqlPreview", "origin", "fieldCount", "ownerId")
+
+
 def _fmt_node(n: dict) -> dict:
     out: dict[str, Any] = {"id": n["id"], "label": n["label"], "group": n["group"]}
     meta = n.get("meta", {})
-    if "sqlPreview" in meta:
-        out["sqlPreview"] = meta["sqlPreview"]
-    if "fieldCount" in meta:
-        out["fieldCount"] = meta["fieldCount"]
+    for key in _NODE_META_KEYS:
+        if meta.get(key):
+            out[key] = meta[key]
     return out
 
 
 def _fmt_edge(e: dict) -> dict:
-    return {
+    out: dict[str, Any] = {
         "from": e["from"],
         "to": e["to"],
         "kind": e["kind"],
         "label": e["label"],
     }
+    if e.get("meta"):
+        out["meta"] = e["meta"]
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -190,26 +198,37 @@ def _action_neighbors(
 
 
 def _action_impact(g: _Graph, node_id: str, skip_fields: bool) -> dict:
-    """Transitive downstream walk — everything that depends on this node."""
+    """Transitive dependents — everything that uses this node.
+
+    Edges point consumer -> dependency, so this walks edges backwards. A
+    table/query's dependents include whatever binds to its field nodes, so the
+    walk also descends through field-owner edges (owner -> field).
+    """
     visited: set[str] = {node_id}
-    frontier: deque[str] = deque([node_id])
+    frontier: deque[tuple[str, int]] = deque([(node_id, 0)])
     affected: list[dict] = []
     edges_used: list[dict] = []
 
-    while frontier:
-        cur = frontier.popleft()
+    while frontier and len(affected) < _MAX_RESULTS:
+        cur, d = frontier.popleft()
         for e in g.out_adj.get(cur, []):
-            if skip_fields and e["kind"] == "field-owner":
+            if e["kind"] != "field-owner" or e["to"] in visited:
                 continue
-            target = e["to"]
+            visited.add(e["to"])
+            # Same depth: a field is part of its owner, not a dependent of it.
+            frontier.append((e["to"], d))
+            if not skip_fields:
+                edges_used.append(_fmt_edge(e))
+                affected.append({**_fmt_node(g.nodes[e["to"]]), "depth": d})
+        for e in g.in_adj.get(cur, []):
+            if e["kind"] == "field-owner":
+                continue
+            source = e["from"]
             edges_used.append(_fmt_edge(e))
-            if target not in visited:
-                visited.add(target)
-                affected.append(_fmt_node(g.nodes[target]))
-                frontier.append(target)
-
-        if len(affected) >= _MAX_RESULTS:
-            break
+            if source not in visited:
+                visited.add(source)
+                affected.append({**_fmt_node(g.nodes[source]), "depth": d + 1})
+                frontier.append((source, d + 1))
 
     truncated = len(affected) >= _MAX_RESULTS
 
@@ -348,15 +367,15 @@ def _action_summary(g: _Graph, group: str | None) -> dict:
         degree[e["from"]] += 1
         degree[e["to"]] += 1
 
-    # Top 15 by degree
-    top = sorted(degree.items(), key=lambda x: x[1], reverse=True)[:15]
+    # Top 15 by degree, after the group filter so it doesn't empty the list
     top_nodes = []
-    for nid, deg in top:
+    for nid, deg in sorted(degree.items(), key=lambda x: x[1], reverse=True):
         node = g.nodes.get(nid)
-        if node:
-            if group and node["group"] != group:
-                continue
-            top_nodes.append({**_fmt_node(node), "degree": deg})
+        if not node or (group and node["group"] != group):
+            continue
+        top_nodes.append({**_fmt_node(node), "degree": deg})
+        if len(top_nodes) == 15:
+            break
 
     # Filter nodes/edges if group specified
     filtered_edge_counts = edge_counts
@@ -402,7 +421,7 @@ def ac_graph_query(
 
     Actions:
         neighbors — direct connections to/from a node
-        impact    — transitive downstream dependents
+        impact    — transitive dependents (what uses this node)
         path      — shortest path between two nodes
         orphans   — nodes with zero incoming edges
         summary   — high-level stats and top-degree nodes
