@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.7.68
+
+**Concatenated SQL, re-pointed recordsets, and what lives inside a library.**
+Fork-only; no new tools (still **71**). Library detection verified live against
+a throwaway host + library database; Northwind 2 unchanged (no regressions).
+
+### Added
+
+- **Recordsets opened on concatenated SQL.** String expressions are reduced to
+  their static text with runtime parts as a placeholder, so
+  `OpenRecordset("SELECT * FROM T WHERE ID=" & x)`, a `strSQL` built across a
+  `_` continuation, and `s = s & "..."` accumulation all resolve their source.
+- **QueryDef / TableDef variables**: `Set qdf = db.QueryDefs("q")`,
+  `.TableDefs("t")` and `.CreateQueryDef("", sql)` feed `qdf.OpenRecordset`.
+- **Library contents**: each referenced library is opened read-only through
+  DAO and its MSysObjects read, so its tables, queries, macros and forms
+  *without* a code module are listed on the library node and resolve (edges
+  into a library carry `meta.inLibrary`). Falls back to TableDefs/QueryDefs if
+  MSysObjects is unreadable; system/hidden objects are skipped.
+
+### Changed
+
+- **Re-pointed recordsets are followed instead of skipped.** Each procedure is
+  walked line by line, so a field read is attributed to whatever the variable
+  points at on that line; `Set rs = Nothing` or an unknown source stops
+  attribution. A string variable reassigned to something that can't be
+  followed is forgotten rather than guessed.
+- Library node meta lists `tables`, `queries`, `forms`, `reports`, `macros`,
+  `modules` and `objectsRead`.
+
 ## 0.7.67
 
 **The four remaining blind spots.** Fork-only; no new tools (still **71**).

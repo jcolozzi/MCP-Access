@@ -819,3 +819,109 @@ def test_locked_library_is_recorded():
     gb = GraphBuilder()
     lib = gb.add_library("Locked", r"C:\libs\Locked.accde", None)
     assert gb.nodes[lib]["meta"]["locked"] is True
+
+
+def test_library_data_objects_macros_and_moduleless_forms_resolve():
+    gb = _builder_with("module:m")
+    lib = gb.add_library(
+        "NWLib", r"C:\libs\NWLib.accda",
+        {"forms": [], "reports": [], "modules": {"modLib": "Function LibFunc()\nEnd Function\n"}},
+        {"table": ["tblLibSettings"], "query": ["qryLib"], "form": ["frmNoModule"],
+         "report": [], "macro": ["mcrLib"], "module": ["modLib"]},
+    )
+    gb._compile_proc_call_re()
+    code = ('DoCmd.RunMacro "mcrLib"\n'
+            'DoCmd.OpenForm "frmNoModule"\n'
+            'DoCmd.OpenTable "tblLibSettings"\n'
+            'x = LibFunc()\n')
+    gb._analyze_code_heuristics("module:m", "module", "m", code, None)
+    assert _missing(gb) == []
+    into_lib = [e for e in gb.edges if e["to"] == lib]
+    assert {e["kind"] for e in into_lib} == {
+        "vba-runmacro", "vba-openform", "vba-opentable", "vba-call"}
+    for e in into_lib:
+        assert e["meta"].get("inLibrary") is (None if e["kind"] == "vba-call" else True)
+    meta = gb.nodes[lib]["meta"]
+    assert meta["tables"] == ["tblLibSettings"] and meta["macros"] == ["mcrLib"]
+    assert meta["objectsRead"] is True and meta["locked"] is False
+
+
+# ---------------------------------------------------------------------------
+# concatenated SQL, re-pointed recordsets, QueryDef variables
+# ---------------------------------------------------------------------------
+
+def test_recordset_on_concatenated_sql():
+    gb = _rs_builder()
+    code = (
+        "Sub A(lngID As Long)\n"
+        '    strSQL = "SELECT Phone FROM Customers " & _\n'
+        '             "WHERE ID = " & lngID\n'
+        "    Set rs = CurrentDb.OpenRecordset(strSQL)\n"
+        "    x = rs!Phone\n"
+        '    Set r2 = db.OpenRecordset("SELECT * FROM Customers WHERE ID=" & lngID)\n'
+        "    y = r2!ID\n"
+        '    s = "SELECT * "\n'
+        '    s = s & "FROM Customers"\n'
+        "    Set r3 = db.OpenRecordset(s, dbOpenSnapshot)\n"
+        "    z = r3!Fax\n"
+        "End Sub\n"
+    )
+    gb._analyze_code_heuristics("module:m", "module", "m", code, None)
+    assert _vba_fields(gb) == {"field:table:Customers:Phone",
+                               "field:table:Customers:ID"}
+    [w] = gb.warnings
+    assert (w["code"], w["meta"]["field"], w["meta"]["via"]) == ("MissingField", "Fax", "r3!Fax")
+
+
+def test_unfollowable_string_stops_resolution():
+    gb = _rs_builder()
+    code = (
+        "Sub A()\n"
+        '    s = "SELECT * FROM Customers"\n'
+        "    s = BuildSql()\n"
+        "    Set rs = db.OpenRecordset(s)\n"
+        "    x = rs!Fax\n"
+        "End Sub\n"
+    )
+    gb._analyze_code_heuristics("module:m", "module", "m", code, None)
+    assert _edges(gb, "vba-field") == [] and gb.warnings == []
+
+
+def test_repointed_recordset_is_attributed_per_line():
+    gb = _rs_builder()
+    gb.add_node("table:Orders", "Orders", "table", is_data=True)
+    gb._known_table_fields["Orders"] = {"OrderDate": "Date"}
+    gb.finalize_data_names()
+    code = (
+        "Sub A()\n"
+        '    Set rs = db.OpenRecordset("Customers")\n'
+        "    a = rs!Phone\n"
+        '    Set rs = db.OpenRecordset("Orders")\n'
+        "    b = rs!OrderDate\n"
+        "    Set rs = Nothing\n"
+        "    c = rs!Anything\n"
+        "End Sub\n"
+    )
+    gb._analyze_code_heuristics("module:m", "module", "m", code, None)
+    assert _vba_fields(gb) == {"field:table:Customers:Phone",
+                               "field:table:Orders:OrderDate"}
+    assert gb.warnings == []
+
+
+def test_querydef_variables_feed_recordsets():
+    gb = _lineage_builder()
+    gb.add_node("module:m", "m", "module")
+    code = (
+        "Sub A()\n"
+        '    Set qdf = db.QueryDefs("qryCust")\n'
+        "    Set rs = qdf.OpenRecordset()\n"
+        "    x = rs!Phone\n"
+        '    Set q2 = db.CreateQueryDef("", "SELECT * FROM Customers")\n'
+        "    Set r2 = q2.OpenRecordset\n"
+        "    y = r2!ID\n"
+        "End Sub\n"
+    )
+    gb._analyze_code_heuristics("module:m", "module", "m", code, None)
+    assert _vba_fields(gb) == {"field:query:qryCust:Phone",
+                               "field:table:Customers:ID"}
+    assert gb.warnings == []

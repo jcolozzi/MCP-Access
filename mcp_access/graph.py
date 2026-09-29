@@ -78,15 +78,22 @@ _STR_ASSIGN_RE = re.compile(
     r'^[ \t]*(?:Let[ \t]+)?(\w+)[ \t]*=[ \t]*"((?:[^"]|"")*)"[ \t]*$', re.I | re.M
 )
 
-# Recordsets: Set rs = ...OpenRecordset(arg) / Me.RecordsetClone; With blocks
+# Recordsets: Set rs = [obj].OpenRecordset(arg) / Me.RecordsetClone; With blocks
 _SET_RE = re.compile(r"^[ \t]*Set[ \t]+(\w+)[ \t]*=[ \t]*(.+?)[ \t]*$", re.I | re.M)
-_OPEN_RS_ARG_RE = re.compile(
-    r'\.\s*OpenRecordset\s*\(\s*((?:"(?:[^"]|"")*"|[^,)\n"])+)', re.I
+_ARG_BODY = r'(?:"(?:[^"]|"")*"|\([^()\n]*\)|[^,()\n"])+'
+_OPEN_RS_CALL_RE = re.compile(
+    r'(?:\b(\w+)\s*(?:\(\s*\))?\s*)?\.\s*OpenRecordset\b\s*(?:\(\s*(' + _ARG_BODY + r'))?',
+    re.I,
 )
+_DEF_RE = re.compile(r'\.\s*(?:QueryDefs|TableDefs)\s*\(\s*(' + _ARG_BODY + r')', re.I)
+_CREATE_QDEF_RE = re.compile(
+    r'\.\s*CreateQueryDef\s*\(\s*' + _ARG_BODY + r'\s*,\s*(' + _ARG_BODY + r')', re.I
+)
+_ASSIGN_RE = re.compile(r"^[ \t]*(?:Let[ \t]+)?(\w+)[ \t]*=[ \t]*(.+?)[ \t]*$", re.I)
+_CONTINUATION_RE = re.compile(r"[ \t]+_[ \t]*\r?\n[ \t]*")
 _ME_RECORDSET_RE = re.compile(r"^Me(?:\s*\.\s*Form)?\s*\.\s*Recordset(?:Clone)?$", re.I)
-_WITH_BLOCK_RE = re.compile(
-    r"^[ \t]*With[ \t]+(.+?)[ \t]*$(.*?)^[ \t]*End[ \t]+With\b", re.I | re.M | re.S
-)
+_WITH_START_RE = re.compile(r"^[ \t]*With[ \t]+(.+?)[ \t]*$", re.I)
+_END_WITH_RE = re.compile(r"^[ \t]*End[ \t]+With\b", re.I)
 _WITH_FIELD_RE = re.compile(
     r'(?:^|(?<=[\s(=,&+\-*/<>]))(?:!(?:\[([^\]]+)\]|(\w+))'
     r'|\.\s*Fields\s*\(\s*"((?:[^"]|"")+)"\s*\))',
@@ -105,6 +112,16 @@ _SQL_TOKEN_RE = re.compile(
 )
 
 _ACCESS_LIBRARY_EXTS = {".accda", ".accdb", ".accde", ".mda", ".mdb", ".mde"}
+
+# MSysObjects.Type -> graph group (1 local, 4 ODBC-linked, 6 Access-linked table)
+_MSYS_TYPES = {1: "table", 4: "table", 6: "table", 5: "query",
+               -32768: "form", -32764: "report", -32766: "macro",
+               -32761: "module"}
+_LIBRARY_GROUPS = ("table", "query", "form", "report", "macro", "module")
+_LIBRARY_META_KEYS = {"table": "tables", "query": "queries", "form": "forms",
+                      "report": "reports", "macro": "macros", "module": "modules"}
+# MSysObjects.Flags: system (0x80000000) or hidden (0x8) — e.g. f_<GUID>_Data
+_MSYS_SKIP_FLAGS = 0x80000008
 
 _VBA_RUNSQL_RE = re.compile(
     r'\bDoCmd\.RunSQL' + _DOCMD_ARG, re.I | re.S
@@ -338,6 +355,10 @@ class GraphBuilder:
             return
         self._edge_dedup.add(key)
         self._edge_counter += 1
+        edge_meta = dict(meta) if meta else {}
+        if to_id.startswith("library:") and kind != "vba-call":
+            # The host's DoCmd/CurrentDb cannot usually reach library objects.
+            edge_meta["inLibrary"] = True
         self.edges.append({
             "id": f"e{self._edge_counter}",
             "from": from_id,
@@ -345,7 +366,7 @@ class GraphBuilder:
             "label": label,
             "kind": kind,
             "arrows": arrows,
-            "meta": dict(meta) if meta else {},
+            "meta": edge_meta,
         })
 
     def add_warning(self, code: str, message: str, meta: dict | None = None) -> None:
@@ -612,16 +633,11 @@ class GraphBuilder:
         return (group, name, fields) if fields else None
 
     def _source_from_arg(
-        self, raw_arg: str, bindings: dict[str, set[str]]
+        self, raw_arg: str, strs: dict[str, str]
     ) -> tuple[str, str, dict] | None:
-        """Recordset source from an OpenRecordset argument (name or SQL)."""
-        kind, value = _classify_arg(_clean_arg(raw_arg))
-        if kind == "variable":
-            vals = bindings.get(value.lower(), set())
-            if len(vals) != 1:
-                return None
-            value = next(iter(vals))
-        elif kind != "literal":
+        """Recordset source from an object name or SQL, possibly concatenated."""
+        value = _resolve_string(_clean_arg(raw_arg), strs)
+        if not value:
             return None
         if _is_likely_sql(value):
             names = _find_referenced_data_names(value, self._known_data_names)
@@ -633,49 +649,93 @@ class GraphBuilder:
         return None
 
     def _recordset_source(
-        self, expr: str, bindings: dict[str, set[str]], me_source: dict | None,
+        self, expr: str, strs: dict[str, str], me_source: dict | None,
+        objs: dict[str, tuple | None],
     ) -> tuple[str, str, dict] | None:
         expr = expr.strip()
         if _ME_RECORDSET_RE.match(expr):
             return self._source_for(me_source)
-        m = _OPEN_RS_ARG_RE.search(expr)
-        return self._source_from_arg(m.group(1), bindings) if m else None
+        m = _OPEN_RS_CALL_RE.search(expr)
+        if not m:
+            return None
+        obj = (m.group(1) or "").lower()
+        if obj in objs:  # qdf.OpenRecordset() on a tracked QueryDef/TableDef
+            return objs[obj]
+        return self._source_from_arg(m.group(2), strs) if m.group(2) else None
+
+    def _def_source(
+        self, expr: str, strs: dict[str, str]
+    ) -> tuple[bool, tuple | None]:
+        """(is a QueryDef/TableDef, its source) for the right side of a Set."""
+        m = _CREATE_QDEF_RE.search(expr)
+        if m:
+            return True, self._source_from_arg(m.group(1), strs)
+        m = _DEF_RE.search(expr)
+        if m:
+            return True, self._source_from_arg(m.group(1), strs)
+        return False, None
 
     def _link_recordset_fields(
         self, owner_id: str, code: str, scope: _VbaScope, me_source: dict | None,
     ) -> None:
+        """Walk each procedure in order so every field read is attributed to the
+        source its recordset points at on that line."""
         for start, end in scope.spans:
-            body = code[start:end]
-            bindings = scope.bindings_at(start)
-            rs_sources: dict[str, tuple | None] = {}
-            for m in _SET_RE.finditer(body):
-                var = m.group(1).lower()
-                src = self._recordset_source(m.group(2), bindings, me_source)
-                if var in rs_sources and rs_sources[var] != src:
-                    rs_sources[var] = None  # re-pointed: ambiguous, skip it
-                elif src is not None or var not in rs_sources:
-                    rs_sources[var] = src
-            for var, src in rs_sources.items():
-                if not src:
+            body = _CONTINUATION_RE.sub(" ", code[start:end])
+            strs = {k: next(iter(v)) for k, v in scope.bindings_at(start).items()
+                    if len(v) == 1}
+            current: dict[str, tuple | None] = {}
+            patterns: dict[str, re.Pattern] = {}
+            objs: dict[str, tuple | None] = {}
+            with_stack: list[tuple[str, tuple | None]] = []
+            for line in body.splitlines():
+                m = _SET_RE.match(line)
+                if m:
+                    var, rhs = m.group(1).lower(), m.group(2)
+                    if not _OPEN_RS_CALL_RE.search(rhs):
+                        is_def, src = self._def_source(rhs, strs)
+                        if is_def:
+                            objs[var] = src
+                            continue
+                    current[var] = self._recordset_source(rhs, strs, me_source, objs)
+                    if var not in patterns:
+                        v = re.escape(var)
+                        patterns[var] = re.compile(
+                            rf'\b{v}\s*(?:!\s*(?:\[([^\]]+)\]|(\w+))'
+                            rf'|(?:\.\s*Fields)?\s*\(\s*"((?:[^"]|"")+)"\s*\))',
+                            re.I)
                     continue
-                v = re.escape(var)
-                for m in re.finditer(
-                    rf'\b{v}\s*(?:!\s*(?:\[([^\]]+)\]|(\w+))'
-                    rf'|(?:\.\s*Fields)?\s*\(\s*"((?:[^"]|"")+)"\s*\))',
-                    body, re.I,
-                ):
-                    fname = m.group(1) or m.group(2) or m.group(3)
-                    self._link_vba_field(owner_id, src, fname, f"{var}!{fname}")
-            for m in _WITH_BLOCK_RE.finditer(body):
-                target = m.group(1).strip()
-                src = rs_sources.get(target.lower()) or self._recordset_source(
-                    target, bindings, me_source)
-                if not src:
+                m = _WITH_START_RE.match(line)
+                if m:
+                    target = m.group(1).strip()
+                    src = (current[target.lower()] if target.lower() in current
+                           else self._recordset_source(target, strs, me_source, objs))
+                    with_stack.append((target, src))
                     continue
-                for f in _WITH_FIELD_RE.finditer(m.group(2)):
-                    fname = f.group(1) or f.group(2) or f.group(3)
-                    self._link_vba_field(owner_id, src, fname,
-                                         f"With {target}: !{fname}")
+                if _END_WITH_RE.match(line):
+                    if with_stack:
+                        with_stack.pop()
+                    continue
+                m = _ASSIGN_RE.match(line)
+                if m:
+                    var = m.group(1).lower()
+                    value = _string_skeleton(m.group(2), strs)
+                    if value is not None:
+                        strs[var] = value
+                    else:
+                        strs.pop(var, None)  # now holds something we can't follow
+                for var, src in current.items():
+                    if not src:
+                        continue
+                    for f in patterns[var].finditer(line):
+                        fname = f.group(1) or f.group(2) or f.group(3)
+                        self._link_vba_field(owner_id, src, fname, f"{var}!{fname}")
+                if with_stack and with_stack[-1][1]:
+                    target, src = with_stack[-1]
+                    for f in _WITH_FIELD_RE.finditer(line):
+                        fname = f.group(1) or f.group(2) or f.group(3)
+                        self._link_vba_field(owner_id, src, fname,
+                                             f"With {target}: !{fname}")
 
     def _link_vba_field(
         self, owner_id: str, src: tuple, fname: str, via: str, *, warn: bool = True,
@@ -1031,26 +1091,41 @@ class GraphBuilder:
                 continue
             self.add_library(
                 _safe_attr(proj, "Name") or os.path.basename(path), path,
-                _library_components(proj))
+                _library_components(proj), _library_objects_from_file(app, path))
 
-    def add_library(self, name: str, path: str, components: dict | None) -> str:
-        """Register a library project: its forms/reports resolve, its procs are callable.
+    def add_library(
+        self, name: str, path: str, components: dict | None,
+        objects: dict[str, list[str]] | None = None,
+    ) -> str:
+        """Register a library project: its objects resolve, its procs are callable.
 
         ``components`` is ``{"forms": [...], "reports": [...], "modules":
-        {name: code}}``, or None when the project is locked (e.g. an .accde).
+        {name: code}}`` from the VBA project, or None when it is locked (e.g.
+        an .accde). ``objects`` is ``{group: [names]}`` read from the library
+        file itself, which also sees tables, queries, macros and forms without
+        a code module; None when the file could not be opened.
         """
         lib_id = f"library:{name}"
         comps = components or {"forms": [], "reports": [], "modules": {}}
-        self.add_node(lib_id, name, "library", meta={
-            "path": path, "locked": components is None,
-            "forms": comps["forms"], "reports": comps["reports"],
-            "modules": sorted(comps["modules"]),
-        })
+        found: dict[str, list[str]] = {g: list((objects or {}).get(g, []))
+                                       for g in _LIBRARY_GROUPS}
         for group, key in (("form", "forms"), ("report", "reports")):
             for obj in comps[key]:
+                if obj.lower() not in {o.lower() for o in found[group]}:
+                    found[group].append(obj)
+        for mod in comps["modules"]:
+            if mod.lower() not in {o.lower() for o in found["module"]}:
+                found["module"].append(mod)
+        self.add_node(lib_id, name, "library", meta={
+            "path": path, "locked": components is None,
+            "objectsRead": objects is not None,
+            **{_LIBRARY_META_KEYS[g]: sorted(found[g], key=str.lower)
+               for g in _LIBRARY_GROUPS},
+        })
+        for group in _LIBRARY_GROUPS:
+            for obj in found[group]:
                 self._library_objects.setdefault((group, obj.lower()), lib_id)
-        for mod, code in comps["modules"].items():
-            self._library_objects.setdefault(("module", mod.lower()), lib_id)
+        for code in comps["modules"].values():
             self.index_module_procs(lib_id, code)
             for k, v in _public_consts(code).items():
                 self._global_consts[k] |= v
@@ -1789,6 +1864,47 @@ def _library_components(proj: Any) -> dict | None:
     return out
 
 
+def _library_objects_from_file(app: Any, path: str) -> dict[str, list[str]] | None:
+    """``{group: [names]}`` of a library database, opened read-only via DAO.
+
+    MSysObjects lists every object including forms without a code module and
+    compiled-only (.accde) ones; if it cannot be read, TableDefs/QueryDefs
+    still give the data objects. None when the file cannot be opened.
+    """
+    try:
+        ldb = app.DBEngine.OpenDatabase(path, False, True)  # shared, read-only
+    except Exception:
+        return None
+    out: dict[str, list[str]] = {g: [] for g in _LIBRARY_GROUPS}
+    try:
+        try:
+            rs = ldb.OpenRecordset(
+                "SELECT [Name], [Type], [Flags] FROM MSysObjects", 4)
+            try:
+                while not rs.EOF:
+                    name = str(rs.Fields("Name").Value or "")
+                    group = _MSYS_TYPES.get(int(rs.Fields("Type").Value or 0))
+                    flags = int(rs.Fields("Flags").Value or 0) & 0xFFFFFFFF
+                    if (group and name and not _is_system(name)
+                            and not flags & _MSYS_SKIP_FLAGS):
+                        out[group].append(name)
+                    rs.MoveNext()
+            finally:
+                rs.Close()
+        except Exception:
+            out = {g: [] for g in _LIBRARY_GROUPS}
+            for coll, group in ((ldb.TableDefs, "table"), (ldb.QueryDefs, "query")):
+                for obj in coll:
+                    if not _is_system(obj.Name):
+                        out[group].append(str(obj.Name))
+    finally:
+        try:
+            ldb.Close()
+        except Exception:
+            pass
+    return out
+
+
 def design_stamps(app: Any, db: Any) -> dict[str, str]:
     """node id -> last design change (DAO LastUpdated / AccessObject.DateModified).
 
@@ -1874,6 +1990,64 @@ def _classify_arg(arg: str) -> tuple[str, str]:
     if _IDENT_RE.fullmatch(arg):
         return "variable", arg
     return "expression", arg
+
+
+def _split_concat(expr: str) -> list[str]:
+    """Split on top-level & / + (outside strings and parentheses)."""
+    parts: list[str] = []
+    depth = 0
+    in_str = False
+    cur = []
+    for ch in expr:
+        if ch == '"':
+            in_str = not in_str
+        elif not in_str:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            elif ch in "&+" and depth == 0:
+                parts.append("".join(cur))
+                cur = []
+                continue
+        cur.append(ch)
+    parts.append("".join(cur))
+    return parts
+
+
+# Stands in for a runtime value inside a concatenated string.
+_SKELETON_HOLE = " ? "
+
+
+def _string_skeleton(expr: str, strs: dict[str, str]) -> str | None:
+    """Static text of a string expression, runtime parts replaced by a hole.
+
+    ``"SELECT * FROM T WHERE ID=" & lngID`` -> ``SELECT * FROM T WHERE ID= ? ``.
+    None when no part is a literal or a variable already holding text.
+    """
+    out: list[str] = []
+    known = False
+    for part in _split_concat(expr):
+        kind, value = _classify_arg(part.strip())
+        if kind == "literal":
+            out.append(value)
+            known = True
+        elif kind == "variable" and value.lower() in strs:
+            out.append(strs[value.lower()])
+            known = True
+        else:
+            out.append(_SKELETON_HOLE)
+    return "".join(out) if known else None
+
+
+def _resolve_string(arg: str, strs: dict[str, str]) -> str | None:
+    """Text of an argument: literal, a variable holding text, or a concatenation."""
+    kind, value = _classify_arg(arg)
+    if kind == "literal":
+        return value
+    if kind == "variable":
+        return strs.get(value.lower())
+    return _string_skeleton(arg, strs)
 
 
 def _proc_spans(code: str) -> list[tuple[int, int]]:
