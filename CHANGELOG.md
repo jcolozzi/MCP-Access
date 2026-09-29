@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.7.70
+
+**Values that exist only at runtime, narrowed statically.** Fork-only; no new
+tools (still **71**); `access_graph` gains `read_data`. On Northwind 2 the two
+remaining dynamic references are now explained as "iterates every table"
+(its ResetDates loop), with zero warnings.
+
+### Added
+
+- **One static evaluator (`_expr_values`)** behind every runtime name, so the
+  sources chain — e.g. a TempVar assigned from a list box whose values come
+  from a table.
+- **Form controls as name sources**: `Me.lstReports`, `Me!cbo.Column(1)`,
+  `Forms!frm!ctl`, or a bare control name in form code. A **Value List** row
+  source resolves from the form design; captions in other columns are
+  reported as `unmatched`, not as missing objects.
+- **Loops over collections**: `For Each td In db.TableDefs … td.Name` (and
+  QueryDefs / AllForms / AllReports / Forms / Containers, or
+  `Set td = db.TableDefs(i)`) is recorded as `iterates: ["table"]`, and
+  `impact` on any table explains it instead of a generic caveat.
+- **`access_graph(read_data=true)`** (opt-in, default off): resolves names
+  stored in table data — Table/Query row sources, `DLookup`-family calls,
+  `rs!Field` on a known recordset — by reading that one column read-only
+  (≤500 rows). Only values matching an existing object name are kept;
+  anything else is **counted, never stored**. Refuses ODBC, SharePoint,
+  Excel and text links, including through queries; linked Access back-ends
+  are fine.
+- Values assigned to a variable anywhere in the procedure are followed;
+  `Nz`/`Trim`/`CStr` wrappers are looked through.
+- **`ControlParseFailed`** warning: a form whose controls can't be read no
+  longer silently loses its control bindings.
+
+### Fixed
+
+- A general-purpose string formatter (`StringFormat`) made one reference fan
+  out to every SQL template in the application: templates are now read
+  before a helper's return values, and a parameter/function with more than
+  20 distinct values is treated as a helper, not a name source.
+- Arguments containing nested calls with commas (`DLookup("F", "T", …)`) are
+  captured whole.
+
 ## 0.7.69
 
 **Runtime names, computed table names, and library code.** Fork-only; no new

@@ -140,6 +140,15 @@ _MAX_RESULTS = 200
 _MAX_DYNAMIC = 20
 
 
+def _dynamic_groups(d: dict) -> set[str]:
+    """Node groups a dynamic reference may touch."""
+    if d.get("iterates"):
+        return set(d["iterates"])
+    if d.get("group") == "data":
+        return {"table", "query"}
+    return {d.get("group", "")}
+
+
 def _action_neighbors(
     g: _Graph, node_id: str, depth: int, direction: str,
     skip_fields: bool,
@@ -252,15 +261,14 @@ def _action_impact(g: _Graph, node_id: str, skip_fields: bool) -> dict:
     }
     group = g.nodes[node_id]["group"]
     dynamic = [d for d in g.meta.get("dynamicReferences", [])
-               if d.get("group") == group
-               or (d.get("group") == "data" and group in ("table", "query"))]
+               if group in _dynamic_groups(d)]
     if dynamic:
         result["dynamic_references"] = {
             "count": len(dynamic),
             "note": (f"These places use a {group} whose name is only known at "
-                     "runtime (partial ones list what was resolved); any of them "
-                     "may also use this node. Inspect them before a rename or "
-                     "delete."),
+                     "runtime: 'iterates' ones touch every object of that kind, "
+                     "partial ones list what was resolved. Any of them may also "
+                     "use this node — inspect them before a rename or delete."),
             "items": dynamic[:_MAX_DYNAMIC],
         }
     return result

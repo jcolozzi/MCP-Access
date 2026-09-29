@@ -39,7 +39,11 @@ _RECORDSOURCE_RE = re.compile(r"^\s+RecordSource\s*=\s*(.*?)\s*$")
 
 # VBA DoCmd / QueryDefs patterns  (case-insensitive, dot-all)
 # First argument as written: literal, variable or expression (classified later)
-_FIRST_ARG = r'\s*\(?\s*(?:\w+\s*:=\s*)?((?:"(?:[^"]|"")*"|[^,:\n"])+)'
+# A parenthesised group, two levels deep: DLookup("F", "T", "ID=" & Nz(x, 0))
+_PAREN_GROUP = (r'\((?:"(?:[^"]|"")*"|\((?:"(?:[^"]|"")*"|[^()\n"])*\)'
+                r'|[^()\n"])*\)')
+_FIRST_ARG = (r'\s*\(?\s*(?:\w+\s*:=\s*)?((?:"(?:[^"]|"")*"|' + _PAREN_GROUP
+              + r'|[^,:\n"()]|\))+)')
 _VBA_PATTERNS: list[dict[str, str]] = [
     {"regex": r'\bDoCmd\.OpenForm' + _FIRST_ARG,
      "group": "form",  "label": "OpenForm",  "kind": "vba-openform"},
@@ -79,7 +83,7 @@ _STR_ASSIGN_RE = re.compile(
 
 # Recordsets: Set rs = [obj].OpenRecordset(arg) / Me.RecordsetClone; With blocks
 _SET_RE = re.compile(r"^[ \t]*Set[ \t]+(\w+)[ \t]*=[ \t]*(.+?)[ \t]*$", re.I | re.M)
-_ARG_BODY = r'(?:"(?:[^"]|"")*"|\([^()\n]*\)|[^,()\n"])+'
+_ARG_BODY = r'(?:"(?:[^"]|"")*"|' + _PAREN_GROUP + r'|[^,()\n"])+'
 _OPEN_RS_CALL_RE = re.compile(
     r'(?:\b(\w+)\s*(?:\(\s*\))?\s*)?\.\s*OpenRecordset\b\s*(?:\(\s*(' + _ARG_BODY + r'))?',
     re.I,
@@ -308,6 +312,13 @@ class GraphBuilder:
         self._tempvar_cache: dict[str, tuple[set[str], bool]] | None = None
         # library node id -> VBA sources (standard modules + code-behind)
         self._library_code: dict[str, list[str]] = {}
+        # form/report id -> {control name lower: row-source info}; id -> RecordSource
+        self._form_controls: dict[str, dict[str, dict]] = {}
+        self._form_rs: dict[str, dict | None] = {}
+        self._query_sql: dict[str, str] = {}
+        # Opt-in: resolve names stored in table data (read-only, Access tables only)
+        self.read_data = False
+        self._db_path: str | None = None
         # Public string constants across standard modules: name -> values
         self._global_consts: dict[str, set[str]] = defaultdict(set)
         # (group, name lower) -> library node id, for objects in referenced libraries
@@ -675,6 +686,7 @@ class GraphBuilder:
             known = set(self._proc_index) | {
                 p["name"].lower() for p in scope.procs if p and p["kind"] == "function"}
             entry.update(_dynamic_hint(expr, scope.proc_at(pos), known))
+            entry["_pos"] = pos
         self.dynamic_refs.append(entry)
 
     # ── post-pass: runtime names ────────────────────────────────────────
@@ -682,57 +694,233 @@ class GraphBuilder:
     def resolve_dynamic_refs(self, sql_dir: str | None) -> None:
         """Retry runtime names once every module has been read.
 
-        Parameters are resolved through their callers' arguments, TempVars
-        through every assignment (VBA and macro SetTempVar), function calls
-        through the literals the function returns. A reference stays listed
-        (``partial``) unless every path was resolved.
+        ``_expr_values`` follows each expression through parameters (their
+        callers), TempVars (every assignment), function results, variables
+        assigned in the procedure, form controls (value lists; row sources
+        with ``read_data``), domain lookups and recordset fields
+        (``read_data``), and loops over a collection. A reference stays listed
+        unless it resolved completely to existing objects.
         """
         remaining: list[dict] = []
         for d in self.dynamic_refs:
-            values, complete = self._dynamic_values(d)
-            if values:
-                self._link_dynamic_values(d, sorted(values), sql_dir)
-                d["resolved"] = sorted(values)[:20]
-            if values and complete:
+            res = self._expr_values(d["ownerId"], d["expr"], d.get("_pos", 0), 0,
+                                    frozenset())
+            matched, unmatched = self._link_dynamic_values(
+                d, sorted(res["values"]), sql_dir, res)
+            if matched:
+                d["resolved"] = matched[:20]
+            if res["iterates"]:
+                d["iterates"] = sorted(res["iterates"])
+            if res["from"]:
+                d["from"] = sorted(res["from"])[:10]
+            if unmatched:
+                # Table data may be sensitive: keep only a count of non-object values.
+                if res["private"]:
+                    d["unmatchedCount"] = len(unmatched)
+                else:
+                    d["unmatched"] = unmatched[:20]
+            if (matched and res["complete"] and not res["iterates"]
+                    and not unmatched):
                 self.resolved_dynamic += 1
                 continue
-            if values:
+            if matched:
                 d["partial"] = True
             remaining.append(d)
         self.dynamic_refs = remaining
 
-    def _dynamic_values(self, d: dict) -> tuple[set[str], bool]:
-        hint = d.get("hint")
-        if hint == "param":
-            return self._param_values(d["ownerId"], d["proc"], d["param"],
-                                      d["paramName"], d.get("default"), 0)
-        if hint == "tempvar":
-            return self._tempvar_values().get(d["tempvar"].lower(), (set(), False))
-        if hint == "function":
-            return self._function_values(d["ownerId"], d["function"])
-        return set(), False
-
     def _link_dynamic_values(
-        self, d: dict, values: list[str], sql_dir: str | None,
-    ) -> None:
-        via = {
-            "param": f"parameter {d.get('paramName')} of {d.get('proc')}",
-            "tempvar": f"TempVars!{d.get('tempvar')}",
-            "function": f"{d.get('function')}() result",
-        }.get(d.get("hint", ""), d["expr"])
+        self, d: dict, values: list[str], sql_dir: str | None, res: dict,
+    ) -> tuple[list[str], list[str]]:
+        """Link resolved values; returns (matched, unmatched).
+
+        Values from data (value lists, tables) that name no object are
+        unmatched, not missing references: data holds more than names.
+        """
+        via = res["via"] or d["expr"]
         owner = d["ownerId"]
+        data = res["data"]
+        matched: list[str] = []
+        unmatched: list[str] = []
         if d["call"] == "Application.Run":
-            self._link_run_values(owner, values, via)
+            for v in values:
+                known = bool(self._proc_index.get(v.rsplit(".", 1)[-1].lower()))
+                (matched if known or not data else unmatched).append(v)
+            self._link_run_values(owner, matched, via)
         elif d["group"] == "data":
             for v in values:
                 if _is_likely_sql(v):
                     sql_id = self._ensure_sql_node(v, f"{owner}:VBA", sql_dir)
                     self.add_edge(owner, sql_id, d["call"], "vba-runsql", "to",
                                   {"preview": _preview(v, 80), "via": via})
-                else:
+                    matched.append(v)
+                elif self._targets_for_name(v, data_only=True) or not data:
                     self._link_data_name(owner, v, d["call"])
+                    matched.append(v)
+                else:
+                    unmatched.append(v)
         elif d["call"] in _PATTERN_BY_LABEL:
-            self._link_named_values(owner, _PATTERN_BY_LABEL[d["call"]], values, via)
+            pat = _PATTERN_BY_LABEL[d["call"]]
+            for v in values:
+                if not v:
+                    continue
+                if self._resolve_named(pat["group"], v, owner) or not data:
+                    self._link_named_values(owner, pat, [v], via)
+                    matched.append(v)
+                else:
+                    unmatched.append(v)
+        return matched, unmatched
+
+    # ── expression evaluation (static) ──────────────────────────────────
+
+    def _expr_values(
+        self, owner_id: str, expr: str, pos: int, depth: int, seen: frozenset,
+    ) -> dict:
+        """Every string an expression can evaluate to, as far as the code shows."""
+        res = _new_res()
+        expr = _clean_arg(expr or "").strip()
+        if not expr or depth > 6:
+            res["complete"] = False
+            return res
+        parts = [p.strip() for p in _split_concat(expr)]
+        if len(parts) > 1:
+            return self._concat_values(owner_id, parts, pos, depth, seen)
+        kind, val = _classify_arg(expr)
+        if kind == "literal":
+            res["values"].add(val)
+            return res
+        m = _TEMPVAR_REF_RE.fullmatch(expr)
+        if m:
+            return self._tempvar_values(m.group(1) or m.group(2) or m.group(3),
+                                        depth, seen)
+        scope = self._scopes.get(owner_id)
+        if kind == "variable":
+            return self._variable_values(owner_id, val, pos, depth, seen)
+        m = _MEMBER_NAME_RE.fullmatch(expr)
+        if m:
+            group = self._loop_group(owner_id, pos, m.group(1))
+            if group:
+                res["iterates"].add(group)
+                res["complete"] = False
+                res["via"] = f"every {group} ({m.group(1)}.Name)"
+                res["from"].add(res["via"])
+                return res
+        m = _CTRL_REF_RE.fullmatch(expr)
+        if m:
+            form = m.group(1) or m.group(2) or m.group(3)
+            form_id = self._object_id("form", form) if form else owner_id
+            if form and form_id not in self._form_controls:
+                form_id = self._object_id("report", form)
+            column = int(m.group(6)) if m.group(6) else None
+            return self._control_values(form_id, (m.group(4) or m.group(5)).lower(),
+                                        column)
+        m = _RS_FIELD_RE.fullmatch(expr)
+        if m:
+            r = self._recordset_field_values(
+                owner_id, m.group(1), m.group(2) or m.group(3) or m.group(4), pos)
+            if r["from"]:  # a recordset was found; else it may be a function call
+                return r
+        m = _FUNC_CALL_RE.fullmatch(expr)
+        if m:
+            name, args = m.group(1), _split_args(m.group(2))
+            low = name.lower()
+            if low in _DOMAIN_FUNCS:
+                return self._domain_values(owner_id, name, args, pos, depth, seen)
+            if low in _PASSTHROUGH_FUNCS and args and args[0]:
+                r = self._expr_values(owner_id, args[0], pos, depth + 1, seen)
+                if low == "nz" and len(args) > 1:
+                    _merge_res(r, self._expr_values(owner_id, args[1], pos,
+                                                    depth + 1, seen))
+                return r
+            # SQL template first: a formatter's return values are every template it gets.
+            strs = {k: next(iter(v)) for k, v in
+                    (scope.bindings_at(pos) if scope else {}).items() if len(v) == 1}
+            template = _resolve_string(args[0], strs) if args and args[0] else None
+            if template and _is_likely_sql(template):
+                res["values"].add(_FORMAT_SLOT_RE.sub(_SKELETON_HOLE, template))
+                res["complete"] = False
+                for a in args[1:]:
+                    r = self._expr_values(owner_id, a, pos, depth + 1, seen)
+                    res["iterates"] |= r["iterates"]
+                    res["from"] |= r["from"]
+                return res
+            if low in self._proc_index or self._local_function(owner_id, low):
+                return self._function_values(owner_id, name, depth, seen)
+        res["complete"] = False
+        return res
+
+    def _concat_values(
+        self, owner_id: str, parts: list[str], pos: int, depth: int, seen: frozenset,
+    ) -> dict:
+        res = _new_res()
+        combos = [""]
+        any_known = False
+        for part in parts:
+            r = self._expr_values(owner_id, part, pos, depth + 1, seen)
+            for key in ("iterates", "from"):
+                res[key] |= r[key]
+            res["data"] |= r["data"]
+            res["private"] |= r["private"]
+            vals = sorted(r["values"])
+            if vals and len(combos) * len(vals) <= _MAX_COMBOS:
+                any_known = True
+                if not r["complete"]:
+                    res["complete"] = False
+            else:
+                vals = [_SKELETON_HOLE]
+                res["complete"] = False
+            combos = [c + v for c in combos for v in vals]
+        if any_known:
+            res["values"] = set(combos)
+        return res
+
+    def _variable_values(
+        self, owner_id: str, name: str, pos: int, depth: int, seen: frozenset,
+    ) -> dict:
+        """A bare identifier: binding, parameter, control, function, or assignment."""
+        res = _new_res()
+        low = name.lower()
+        scope = self._scopes.get(owner_id)
+        bound = scope.bindings_at(pos).get(low) if scope else None
+        if bound:
+            res["values"] |= bound
+            return res
+        proc = scope.proc_at(pos) if scope else None
+        params = [p for p, _ in (proc or {}).get("params", [])]
+        if low in params:
+            i = params.index(low)
+            return self._param_values(owner_id, proc["name"], i, low,
+                                      proc["params"][i][1], depth, seen)
+        if low in self._form_controls.get(owner_id, {}):
+            return self._control_values(owner_id, low, None)
+        if low in self._proc_index or self._local_function(owner_id, low):
+            return self._function_values(owner_id, name, depth, seen)
+        return self._assigned_values(owner_id, name, pos, depth, seen)
+
+    def _assigned_values(
+        self, owner_id: str, name: str, pos: int, depth: int, seen: frozenset,
+    ) -> dict:
+        """Union of every value assigned to ``name`` in the enclosing procedure."""
+        res = _new_res()
+        res["complete"] = False
+        scope, code = self._scopes.get(owner_id), self._analyzed_code.get(owner_id)
+        span = next(((s, e) for s, e in (scope.spans if scope else [])
+                     if s <= pos < e), None)
+        key = ("var", owner_id, span, name.lower())
+        if not span or key in seen:
+            return res
+        s, e = span
+        found = False
+        complete = True
+        for m in re.finditer(
+                rf"^[ \t]*(?:Let[ \t]+)?{re.escape(name)}[ \t]*=[ \t]*(.+?)[ \t]*$",
+                _mask_continuations(code[s:e]), re.I | re.M):
+            found = True
+            r = self._expr_values(owner_id, m.group(1), s + m.start(1), depth + 1,
+                                  seen | {key})
+            _merge_res(res, r)
+            complete = complete and r["complete"] and bool(r["values"])
+        res["complete"] = found and complete
+        return res
 
     def _masked_for(self, cid: str) -> tuple[str, str]:
         """(strings/declarations blanked, continuations joined) copies of owner code."""
@@ -769,110 +957,263 @@ class GraphBuilder:
 
     def _param_values(
         self, owner_id: str, proc_name: str, idx: int, pname: str,
-        default: str | None, depth: int,
-    ) -> tuple[set[str], bool]:
-        """Literals a parameter receives across all call sites (and its default)."""
-        values: set[str] = {default} if default is not None else set()
+        default: str | None, depth: int, seen: frozenset,
+    ) -> dict:
+        """Values a parameter receives across all call sites (and its default)."""
+        res = _new_res()
+        res["via"] = f"parameter {pname} of {proc_name}"
+        if default is not None:
+            res["values"].add(default)
+        key = ("param", owner_id, proc_name.lower(), idx)
         scope = self._scopes.get(owner_id)
         info = next((p for p in (scope.procs if scope else [])
                      if p and p["name"].lower() == proc_name.lower()), None)
-        if not info:
-            return values, False
-        sites = self._call_sites(owner_id, info)
+        sites = self._call_sites(owner_id, info) if info and key not in seen else []
         if not sites:
-            return values, False
-        complete = True
+            res["complete"] = False
+            return res
         for cid, pos, (positional, named) in sites:
             arg = named.get(pname, positional[idx] if idx < len(positional) else None)
             if arg is None:
-                complete = complete and default is not None
+                res["complete"] = res["complete"] and default is not None
                 continue
-            kind, val = _classify_arg(arg.strip())
-            if kind == "literal":
-                values.add(val)
-                continue
-            cscope = self._scopes[cid]
-            bindings = cscope.bindings_at(pos)
-            if kind == "variable":
-                if val.lower() in bindings:
-                    values |= bindings[val.lower()]
-                    continue
-                cproc = cscope.proc_at(pos)
-                params = [p for p, _ in (cproc or {}).get("params", [])]
-                if cproc and val.lower() in params and depth < 3:
-                    i2 = params.index(val.lower())
-                    v2, c2 = self._param_values(cid, cproc["name"], i2, val.lower(),
-                                                cproc["params"][i2][1], depth + 1)
-                    values |= v2
-                    complete = complete and c2
-                    continue
-            else:
-                strs = {k: next(iter(v)) for k, v in bindings.items() if len(v) == 1}
-                text = _string_skeleton(arg, strs)
-                if text is not None and _SKELETON_HOLE not in text:
-                    values.add(text)
-                    continue
-            complete = False
-        return values, complete
+            r = self._expr_values(cid, arg, pos, depth + 1, seen | {key})
+            _merge_res(res, r, keep_via=True)
+            res["complete"] = res["complete"] and r["complete"] and bool(r["values"])
+        return _cap_general(res, f"parameter {pname} of {proc_name}")
 
-    def _tempvar_values(self) -> dict[str, tuple[set[str], bool]]:
-        """TempVar name (lower) -> (literal values assigned, all assignments literal)."""
-        if self._tempvar_cache is not None:
-            return self._tempvar_cache
-        vals: dict[str, set[str]] = defaultdict(set)
-        unknown: set[str] = set()
-
-        def add(name: str, rhs: str) -> None:
-            rhs = rhs.strip().replace('\\"', '"')
-            if rhs.startswith("="):
-                rhs = rhs[1:].strip()
-            kind, value = _classify_arg(rhs)
-            if kind == "literal":
-                vals[name.lower()].add(value)
-            else:
-                unknown.add(name.lower())
-
-        for code in self._analyzed_code.values():
-            for m in _TEMPVAR_SET_RE.finditer(code):
-                add(m.group(1) or m.group(2) or m.group(3), m.group(4))
-            for m in _TEMPVAR_ADD_RE.finditer(code):
-                add(m.group(1), m.group(2))
-        for name, expr in self._macro_tempvars:
-            add(name, expr)
-        self._tempvar_cache = {k: (vals.get(k, set()), k not in unknown)
-                               for k in set(vals) | unknown}
+    def _tempvar_assignments(self) -> dict[str, list[tuple[str | None, int, str]]]:
+        """TempVar name (lower) -> [(owner id or None for a macro, offset, rhs)]."""
+        if self._tempvar_cache is None:
+            found: dict[str, list] = defaultdict(list)
+            for cid, code in self._analyzed_code.items():
+                for m in _TEMPVAR_SET_RE.finditer(code):
+                    found[(m.group(1) or m.group(2) or m.group(3)).lower()].append(
+                        (cid, m.start(4), m.group(4)))
+                for m in _TEMPVAR_ADD_RE.finditer(code):
+                    found[m.group(1).lower()].append((cid, m.start(2), m.group(2)))
+            for name, expr in self._macro_tempvars:
+                found[name.lower()].append((None, 0, expr))
+            self._tempvar_cache = found
         return self._tempvar_cache
 
-    def _function_values(self, owner_id: str, fname: str) -> tuple[set[str], bool]:
-        """Literals a function returns (assignments to its own name)."""
-        low = fname.lower()
+    def _tempvar_values(self, name: str, depth: int, seen: frozenset) -> dict:
+        res = _new_res()
+        res["via"] = f"TempVars!{name}"
+        key = ("tempvar", name.lower())
+        assigns = self._tempvar_assignments().get(name.lower(), [])
+        if not assigns or key in seen:
+            res["complete"] = False
+            return res
+        for cid, pos, rhs in assigns:
+            if cid is None:  # macro SetTempVar: an expression string
+                rhs = rhs.strip().replace('\\"', '"')
+                rhs = rhs[1:].strip() if rhs.startswith("=") else rhs
+                kind, value = _classify_arg(rhs)
+                if kind == "literal":
+                    res["values"].add(value)
+                else:
+                    res["complete"] = False
+                continue
+            r = self._expr_values(cid, rhs, pos, depth + 1, seen | {key})
+            _merge_res(res, r, keep_via=True)
+            res["complete"] = res["complete"] and r["complete"] and bool(r["values"])
+        return res
+
+    def _local_function(self, owner_id: str, low: str) -> bool:
         scope = self._scopes.get(owner_id)
-        if scope and any(p and p["name"].lower() == low for p in scope.procs):
-            candidates = [owner_id]
-        else:
-            candidates = list(self._proc_index.get(low, []))
-        for cid in candidates:
+        return bool(scope) and any(
+            p and p["name"].lower() == low and p["kind"] == "function"
+            for p in scope.procs)
+
+    def _function_values(
+        self, owner_id: str, fname: str, depth: int, seen: frozenset,
+    ) -> dict:
+        """Values a function returns (everything assigned to its own name)."""
+        res = _new_res()
+        res["via"] = f"{fname}() result"
+        low = fname.lower()
+        key = ("func", low)
+        candidates = ([owner_id] if self._local_function(owner_id, low)
+                      else list(self._proc_index.get(low, [])))
+        for cid in ([] if key in seen else candidates):
             scope, code = self._scopes.get(cid), self._analyzed_code.get(cid)
             if not scope or code is None:
                 continue
             for (s, e), info in zip(scope.spans, scope.procs):
                 if not info or info["name"].lower() != low or info["kind"] != "function":
                     continue
-                strs = {k: next(iter(v)) for k, v in scope.bindings_at(s).items()
-                        if len(v) == 1}
-                rhs_all = re.findall(
-                    rf"^[ \t]*{re.escape(info['name'])}[ \t]*=[ \t]*(.+?)[ \t]*$",
-                    _mask_continuations(code[s:e]), re.I | re.M)
-                values: set[str] = set()
-                complete = bool(rhs_all)
-                for rhs in rhs_all:
-                    text = _resolve_string(rhs.strip(), strs)
-                    if text is not None and _SKELETON_HOLE not in text:
-                        values.add(text)
-                    else:
-                        complete = False
-                return values, complete
-        return set(), False
+                found = False
+                for m in re.finditer(
+                        rf"^[ \t]*{re.escape(info['name'])}[ \t]*=[ \t]*(.+?)[ \t]*$",
+                        _mask_continuations(code[s:e]), re.I | re.M):
+                    found = True
+                    r = self._expr_values(cid, m.group(1), s + m.start(1), depth + 1,
+                                          seen | {key})
+                    _merge_res(res, r, keep_via=True)
+                    res["complete"] = (res["complete"] and r["complete"]
+                                       and bool(r["values"]))
+                res["complete"] = res["complete"] and found
+                return _cap_general(res, f"{fname}()")
+        res["complete"] = False
+        return res
+
+    def _loop_group(self, owner_id: str, pos: int, var: str) -> str | None:
+        """Object group a For Each / indexed-Set variable ranges over, if any."""
+        scope, code = self._scopes.get(owner_id), self._analyzed_code.get(owner_id)
+        span = next(((s, e) for s, e in (scope.spans if scope else [])
+                     if s <= pos < e), None)
+        if not span:
+            return None
+        body = code[span[0]:span[1]]
+        v = re.escape(var)
+        for rx in (rf"^[ \t]*For[ \t]+Each[ \t]+{v}[ \t]+In[ \t]+(.+?)[ \t]*$",
+                   rf"^[ \t]*Set[ \t]+{v}[ \t]*=[ \t]*(.+?)[ \t]*$"):
+            for m in re.finditer(rx, body, re.I | re.M):
+                group = _collection_group(m.group(1))
+                if group:
+                    return group
+        return None
+
+    def _control_values(self, form_id: str, ctl: str, column: int | None) -> dict:
+        """Values a list/combo box can hold: its value list, or (read_data) its
+        row source's column."""
+        res = _new_res()
+        info = self._form_controls.get(form_id, {}).get(ctl)
+        form = self.nodes.get(form_id, {}).get("label", form_id)
+        if not info or not info["row_source"]:
+            res["complete"] = False  # typed in by the user, or unknown control
+            return res
+        col = column if column is not None else max(info["bound_column"] - 1, 0)
+        label = f"{form}.{info['name']}" + (f".Column({column})" if column is not None else "")
+        res["via"] = label
+        res["data"] = True
+        if info["row_source_type"].lower() == "value list":
+            items = _value_list_items(info["row_source"])
+            res["values"] |= {v for v in items[col::max(info["column_count"], 1)] if v}
+            res["from"].add(f"{label} (value list)")
+            return res
+        if info["row_source_type"] and info["row_source_type"].lower() != "table/query":
+            res["complete"] = False  # "Field List" etc.
+            return res
+        rows = self._read_column(info["row_source"], index=col)
+        if rows is None:
+            res["complete"] = False
+            res["from"].add(f"{label} (row source; {self._unread_reason()})")
+            return res
+        res["values"] |= rows
+        res["private"] = True
+        res["from"].add(f"{label} (row source data)")
+        return res
+
+    def _recordset_field_values(
+        self, owner_id: str, var: str, field: str, pos: int,
+    ) -> dict:
+        """(read_data) Values of ``rs!Field`` where rs is opened on a known source."""
+        res = _new_res()
+        res["complete"] = False
+        scope, code = self._scopes.get(owner_id), self._analyzed_code.get(owner_id)
+        span = next(((s, e) for s, e in (scope.spans if scope else [])
+                     if s <= pos < e), None)
+        if not span:
+            return res
+        rhs = None
+        for m in _SET_RE.finditer(_mask_continuations(code[span[0]:span[1]])):
+            if m.group(1).lower() == var.lower() and span[0] + m.start() <= pos:
+                rhs = m.group(2)
+        strs = {k: next(iter(v)) for k, v in scope.bindings_at(span[0]).items()
+                if len(v) == 1}
+        src = self._recordset_source(rhs, strs, self._form_rs.get(owner_id), {}) if rhs else None
+        if not src:
+            return res
+        return self._column_of(src[0], src[1], field, f"{var}!{field}")
+
+    def _domain_values(
+        self, owner_id: str, func: str, args: list[str], pos: int, depth: int,
+        seen: frozenset,
+    ) -> dict:
+        """(read_data) DLookup("Field", "Domain", ...) -> every value of the column."""
+        res = _new_res()
+        res["complete"] = False
+        if len(args) < 2:
+            return res
+        field = next(iter(self._expr_values(owner_id, args[0], pos, depth + 1,
+                                            seen)["values"]), None)
+        domain = next(iter(self._expr_values(owner_id, args[1], pos, depth + 1,
+                                             seen)["values"]), None)
+        if not field or not domain:
+            return res
+        targets = self._targets_for_name(domain, data_only=True)
+        if not targets:
+            return res
+        return self._column_of(targets[0]["group"], targets[0]["name"],
+                               _strip_brackets(field), f"{func}({field}, {domain})")
+
+    def _column_of(self, group: str, name: str, field: str, label: str) -> dict:
+        """(read_data) Every value of one column of a table/query (all rows)."""
+        res = _new_res()
+        res["via"] = label
+        res["data"] = True
+        rows = self._read_column(f"SELECT [{field}] FROM [{name}]", index=0)
+        if rows is None:
+            res["complete"] = False
+            res["from"].add(f"{name}.{field} ({self._unread_reason()})")
+            return res
+        res["values"] |= rows
+        res["private"] = True
+        res["from"].add(f"{name}.{field} (all rows)")
+        return res
+
+    def _read_column(self, source: str, index: int = 0) -> set[str] | None:
+        """Distinct values of column ``index`` of a table/query/SQL, read-only.
+
+        None unless ``read_data`` is on and every table behind ``source`` is a
+        local or linked Access table \u2014 never an ODBC/SharePoint/Excel link,
+        which could reach a server.
+        """
+        if not self.read_data or not self._db_path or not self._reads_only_access(source):
+            return None
+        try:
+            db = _Session.connect(self._db_path).CurrentDb()
+            rs = db.OpenRecordset(source, 4)  # dbOpenSnapshot
+        except Exception:
+            return None
+        values: set[str] = set()
+        try:
+            n = 0
+            while not rs.EOF and n < _MAX_DATA_ROWS:
+                v = rs.Fields(index).Value
+                if v is not None and str(v).strip():
+                    values.add(str(v).strip())
+                rs.MoveNext()
+                n += 1
+        except Exception:
+            return None
+        finally:
+            try:
+                rs.Close()
+            except Exception:
+                pass
+        return values
+
+    def _unread_reason(self) -> str:
+        return "not read" if self.read_data else "needs read_data"
+
+    def _reads_only_access(self, source: str, depth: int = 0) -> bool:
+        names = _find_referenced_data_names(source, self._known_data_names)
+        if not names or depth > 4:
+            return False
+        for name in names:
+            for t in self._targets_for_name(name, data_only=True):
+                meta = self.nodes[t["node_id"]]["meta"]
+                connect = str(meta.get("connect") or "")
+                if connect and not connect.upper().startswith(";DATABASE="):
+                    return False  # ODBC / SharePoint / Excel / text link
+                if t["group"] == "query":
+                    sql = self._query_sql.get(t["name"], "")
+                    if not sql or not self._reads_only_access(sql, depth + 1):
+                        return False
+        return True
 
     # ── recordset / Me field references ─────────────────────────────────
 
@@ -1503,6 +1844,7 @@ class GraphBuilder:
         rs_target = self._resolve_record_source(
             object_id, group, name, record_source, sql_dir
         )
+        self._form_rs[object_id] = rs_target
 
         # --- Code behind ---
         _, vba_code = split_code_behind(export_text)
@@ -1510,12 +1852,29 @@ class GraphBuilder:
         # --- Controls ---
         try:
             parsed = _get_parsed_controls(db_path, group, name)
-        except Exception:
+        except Exception as exc:
             parsed = {"controls": []}
+            self.add_warning(
+                "ControlParseFailed",
+                f"Could not read the controls of {group} '{name}'; its control "
+                f"bindings are missing from the graph: {exc}",
+                {"owner": name, "group": group, "ownerId": object_id},
+            )
 
         for ctrl in parsed.get("controls", []):
             ctrl_name = ctrl.get("name", "")
             ctrl_type_name = ctrl.get("type_name", "")
+            if ctrl_name:
+                raw = ctrl.get("raw_block", "")
+                row_src = ctrl.get("row_source", "")
+                self._form_controls.setdefault(object_id, {})[ctrl_name.lower()] = {
+                    "name": ctrl_name,
+                    "row_source": row_src,
+                    "row_source_type": (_raw_prop(raw, "RowSourceType")
+                                        or ("Table/Query" if row_src else "")),
+                    "bound_column": _int_or(_raw_prop(raw, "BoundColumn"), 1),
+                    "column_count": _int_or(_raw_prop(raw, "ColumnCount"), 1),
+                }
 
             # SourceObject (subform/subreport)
             so = ctrl.get("source_object", "")
@@ -1879,6 +2238,7 @@ class GraphBuilder:
                         )
             self._link_object_refs(node_id, sql, {"via": "SQL"})
             self._read_query_fields(qd, name, node_id)
+            self._query_sql[name] = sql
             queries.append((node_id, sql))
 
         # Second pass: every query's output fields are known by now, so a
@@ -2038,7 +2398,10 @@ class GraphBuilder:
                 "database": db_path,
                 "generatedAt": datetime.now(timezone.utc).isoformat(),
                 "designStamps": self.design_stamps,
-                "dynamicReferences": self.dynamic_refs,
+                "dynamicReferences": [
+                    {k: v for k, v in d.items() if not k.startswith("_")}
+                    for d in self.dynamic_refs
+                ],
                 "fieldNodeMode": {
                     "none": "None",
                     "referenced": "ReferencedOnly",
@@ -2444,6 +2807,109 @@ def _dynamic_hint(expr: str, proc: dict | None, known_procs: set[str]) -> dict:
     return {}
 
 
+# ── static expression evaluation helpers ────────────────────────────────
+
+_MAX_COMBOS = 50        # cap on concatenation combinations
+_MAX_DATA_ROWS = 500    # cap on rows read per column with read_data
+_MEMBER_NAME_RE = re.compile(r"(\w+)\s*\.\s*Name")
+_FUNC_CALL_RE = re.compile(r"([A-Za-z_]\w*)\s*\((.*)\)", re.S)
+# Me.ctl / Me!ctl / Forms!frm!ctl / [Forms]![frm]![ctl] / Forms("frm")!ctl,
+# optionally .Value / .Column(n[, row]) / .ItemData(i)
+_CTRL_REF_RE = re.compile(
+    r'(?:Me|\[?Forms\]?\s*!\s*(?:\[([^\]]+)\]|(\w+))|Forms\s*\(\s*"([^"]+)"\s*\))'
+    r'\s*[.!]\s*(?:\[([^\]]+)\]|(\w+))'
+    r'(?:\s*\.\s*(?:Value|Column\s*\(\s*(\d+)\s*(?:,[^)]*)?\)|ItemData\s*\([^)]*\)))?',
+    re.I,
+)
+# rs!Field / rs![Field] / rs("Field") / rs.Fields("Field"), optionally .Value
+_RS_FIELD_RE = re.compile(
+    r'(\w+)\s*(?:!\s*(?:\[([^\]]+)\]|(\w+))|(?:\.\s*Fields)?\s*\(\s*"([^"]+)"\s*\))'
+    r'(?:\s*\.\s*Value)?',
+    re.I,
+)
+_DOMAIN_FUNCS = {"dlookup", "dfirst", "dlast", "dmax", "dmin"}
+# Functions that return (a transform of) their first argument
+_PASSTHROUGH_FUNCS = {"nz", "cstr", "trim", "ltrim", "rtrim", "ucase", "lcase"}
+
+
+def _new_res() -> dict:
+    """Result of evaluating an expression statically."""
+    return {"values": set(), "complete": True, "iterates": set(), "from": set(),
+            "via": "", "data": False, "private": False}
+
+
+# More distinct values than this through one parameter/function means a
+# general-purpose helper (a string formatter, a logger): not a name source.
+_MAX_GENERAL_VALUES = 20
+
+
+def _cap_general(res: dict, what: str) -> dict:
+    if len(res["values"]) > _MAX_GENERAL_VALUES:
+        res["values"] = set()
+        res["complete"] = False
+        res["from"].add(f"{what} takes too many values to be a name source")
+    return res
+
+
+def _merge_res(res: dict, other: dict, *, keep_via: bool = False) -> None:
+    """Fold ``other`` into ``res`` (completeness is the caller's decision)."""
+    res["values"] |= other["values"]
+    res["iterates"] |= other["iterates"]
+    res["from"] |= other["from"]
+    res["data"] |= other["data"]
+    res["private"] |= other["private"]
+    if not keep_via and not res["via"]:
+        res["via"] = other["via"]
+
+
+def _collection_group(expr: str) -> str | None:
+    """Object group a collection expression ranges over (TableDefs -> table...)."""
+    e = expr.strip().lower()
+    if re.search(r'\(\s*"', e):
+        return None  # TableDefs("tblX") names one object, not the collection
+    for pattern, group in ((r"\btabledefs\b", "table"), (r"\bquerydefs\b", "query"),
+                           (r"\ballforms\b|containers\s*\(\s*.forms.", "form"),
+                           (r"\ballreports\b|containers\s*\(\s*.reports.", "report"),
+                           (r"\ballmacros\b|containers\s*\(\s*.scripts.", "macro"),
+                           (r"\ballmodules\b|containers\s*\(\s*.modules.", "module")):
+        if re.search(pattern, e):
+            return group
+    if re.fullmatch(r"(?:application\s*\.\s*)?forms", e):
+        return "form"
+    if re.fullmatch(r"(?:application\s*\.\s*)?reports", e):
+        return "report"
+    return None
+
+
+def _value_list_items(row_source: str) -> list[str]:
+    """Items of a Value List row source: "a";"b";c -> [a, b, c]."""
+    items: list[str] = []
+    cur: list[str] = []
+    in_q = False
+    for ch in row_source.replace('\\"', '"'):
+        if ch == '"':
+            in_q = not in_q
+        elif ch == ";" and not in_q:
+            items.append("".join(cur).strip())
+            cur = []
+        else:
+            cur.append(ch)
+    items.append("".join(cur).strip())
+    return items
+
+
+def _raw_prop(block: str, name: str) -> str:
+    m = re.search(rf'^\s*{name}\s*=\s*"?([^"\r\n]*)"?\s*$', block, re.M)
+    return m.group(1).strip() if m else ""
+
+
+def _int_or(text: str, default: int) -> int:
+    try:
+        return int(text)
+    except (TypeError, ValueError):
+        return default
+
+
 def _call_args(code: str, pos: int) -> tuple[list[str], dict[str, str]] | None:
     """Arguments of the call whose procedure name ends at ``pos``.
 
@@ -2834,6 +3300,7 @@ def ac_graph(
     include_macro_heuristics: bool = True,
     embed_viewer: bool = True,
     raw_export_mode: str = "none",
+    read_data: bool = False,
 ) -> dict:
     """Build a dependency graph for the given Access database.
 
@@ -2855,6 +3322,8 @@ def ac_graph(
 
     gb = GraphBuilder(field_mode=field_mode)
     gb.raw_export_mode = raw_export_mode
+    gb.read_data = bool(read_data)
+    gb._db_path = db_path
     if raw_export_mode == "debug":
         gb.raw_dir = os.path.join(out_dir, "raw")
         os.makedirs(gb.raw_dir, exist_ok=True)

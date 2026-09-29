@@ -1697,6 +1697,18 @@ TOOLS = [
                     "default": "none",
                     "description": "none: compute rawHash/rawSize only (temp exports cleaned up). debug: also keep raw SaveAsText exports under <out>/raw/{forms,reports,queries,macros,modules}",
                 },
+                "read_data": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "Opt-in. Resolve object names stored in table data — combo/list "
+                        "row sources, DLookup, rs!Field on a table — by reading those "
+                        "columns read-only (max 500 rows each). Only values matching an "
+                        "existing object name are kept; others are counted, never stored. "
+                        "Never reads ODBC/SharePoint/Excel links. Value-list row sources "
+                        "are form design and resolve without this."
+                    ),
+                },
             },
             "required": ["db_path"],
         },

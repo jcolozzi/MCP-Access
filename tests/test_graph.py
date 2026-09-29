@@ -17,8 +17,9 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from mcp_access.graph import (  # noqa: E402
-    GraphBuilder, _bare_field_refs, _embedded_macro_blocks,
+    GraphBuilder, _bare_field_refs, _collection_group, _embedded_macro_blocks,
     _extract_record_source, _qualified_field_refs, _strip_vba_comments,
+    _value_list_items,
 )
 from mcp_access import graph_query  # noqa: E402
 from mcp_access.graph_query import ac_graph_query  # noqa: E402
@@ -1146,3 +1147,142 @@ def test_library_code_depends_on_host_objects_only():
     assert all(to != lib for _, to in out)                 # own form: no self edge
     assert ("vba-call", "module:modHost") not in out       # can't call host code
     assert _missing(gb) == []
+
+
+# ---------------------------------------------------------------------------
+# values from controls, table data, and loops over collections
+# ---------------------------------------------------------------------------
+
+def test_value_list_and_collection_helpers():
+    assert _value_list_items('"rptA";"Sales A";rptB;"Sales; B"') == [
+        "rptA", "Sales A", "rptB", "Sales; B"]
+    assert _value_list_items('\\"rptA\\";\\"rptB\\"') == ["rptA", "rptB"]
+    assert _collection_group("CurrentDb.TableDefs") == "table"
+    assert _collection_group("CurrentProject.AllForms") == "form"
+    assert _collection_group("Forms") == "form"
+    assert _collection_group('db.TableDefs("tblX")') is None
+    assert _collection_group("rs.Fields") is None
+
+
+def _reports_builder() -> GraphBuilder:
+    gb = _builder_with("form:frmReports", "module:m", "report:rptA", "report:rptB")
+    gb._form_controls["form:frmReports"] = {
+        "lstreports": {"name": "lstReports", "row_source_type": "Value List",
+                       "row_source": '"rptA";"Sales A";"rptB";"Sales B"',
+                       "bound_column": 1, "column_count": 2},
+        "cboreport": {"name": "cboReport", "row_source_type": "Table/Query",
+                      "row_source": "SELECT ReportName FROM tblReports",
+                      "bound_column": 1, "column_count": 1},
+    }
+    return gb
+
+
+def test_value_list_control_resolves_bound_and_other_columns():
+    gb = _reports_builder()
+    gb._analyze_code_heuristics("form:frmReports", "form", "frmReports", (
+        "Private Sub cmdA_Click()\n"
+        "    DoCmd.OpenReport Me.lstReports, acViewPreview\n"
+        "    DoCmd.OpenReport lstReports\n"
+        "    DoCmd.OpenReport Me!lstReports.Column(1)\n"
+        "End Sub\n"), None)
+    gb.resolve_dynamic_refs(None)
+    assert {e["to"] for e in _edges(gb, "vba-openreport")} == {"report:rptA", "report:rptB"}
+    assert _missing(gb) == []  # captions in column 1 are data, not broken names
+    [left] = gb.dynamic_refs
+    assert left["expr"] == "Me!lstReports.Column(1)"
+    assert left["unmatched"] == ["Sales A", "Sales B"]
+
+
+def test_tempvar_set_from_a_control_chains_through():
+    gb = _reports_builder()
+    gb._analyze_code_heuristics("form:frmReports", "form", "frmReports",
+                                "Private Sub lst_AfterUpdate()\n"
+                                "    TempVars!R = Me.lstReports\nEnd Sub\n", None)
+    gb._analyze_code_heuristics("module:m", "module", "m",
+                                "Sub Go()\n    DoCmd.OpenReport TempVars!R\nEnd Sub\n", None)
+    gb.resolve_dynamic_refs(None)
+    assert _opened(gb, "vba-openreport") == {("report:rptA", "TempVars!R"),
+                                             ("report:rptB", "TempVars!R")}
+    assert gb.dynamic_refs == []
+
+
+def test_row_source_needs_read_data_and_keeps_data_private(monkeypatch):
+    gb = _reports_builder()
+    code = "Private Sub cmdB_Click()\n    DoCmd.OpenReport Me.cboReport\nEnd Sub\n"
+    gb._analyze_code_heuristics("form:frmReports", "form", "frmReports", code, None)
+    gb.resolve_dynamic_refs(None)
+    [d] = gb.dynamic_refs
+    assert "needs read_data" in d["from"][0] and "resolved" not in d
+
+    gb = _reports_builder()
+    gb.read_data = True
+    monkeypatch.setattr(gb, "_read_column",
+                        lambda source, index=0: {"rptA", "Jane Doe SSN 123"})
+    gb._analyze_code_heuristics("form:frmReports", "form", "frmReports", code, None)
+    gb.resolve_dynamic_refs(None)
+    assert {e["to"] for e in _edges(gb, "vba-openreport")} == {"report:rptA"}
+    [d] = gb.dynamic_refs
+    assert d["unmatchedCount"] == 1 and "unmatched" not in d
+    assert "Jane Doe" not in json.dumps(gb.dynamic_refs + gb.edges + gb.warnings)
+
+
+def test_dlookup_and_recordset_field_with_read_data(monkeypatch):
+    gb = _builder_with("module:m", "table:tblMenu", "form:frmA", "form:frmB")
+    gb._known_table_fields["tblMenu"] = {"ID": "Long", "FormName": "Text"}
+    gb.finalize_data_names()
+    gb.read_data = True
+    reads: list[str] = []
+
+    def fake_read(source, index=0):
+        reads.append(source)
+        return {"frmA", "frmB"}
+
+    monkeypatch.setattr(gb, "_read_column", fake_read)
+    gb._analyze_code_heuristics("module:m", "module", "m", (
+        "Sub Go()\n"
+        '    DoCmd.OpenForm DLookup("FormName", "tblMenu", "ID=" & 3)\n'
+        '    Set rs = CurrentDb.OpenRecordset("tblMenu")\n'
+        "    DoCmd.OpenForm rs!FormName\n"
+        "End Sub\n"), None)
+    gb.resolve_dynamic_refs(None)
+    assert {e["to"] for e in _edges(gb, "vba-openform")} == {"form:frmA", "form:frmB"}
+    assert reads == ["SELECT [FormName] FROM [tblMenu]"] * 2
+    assert gb.dynamic_refs == []
+
+
+def test_loops_over_collections_iterate_every_object(tmp_path):
+    gb = _rs_builder()
+    gb.add_node("query:qryX", "qryX", "query", is_data=True)
+    gb._analyze_code_heuristics("module:m", "module", "m", (
+        "Sub ResetAll()\n"
+        "    For Each td In CurrentDb.TableDefs\n"
+        '        CurrentDb.Execute "UPDATE " & td.Name & " SET Flag = 0"\n'
+        "    Next\n"
+        "    For Each frm In CurrentProject.AllForms\n"
+        "        DoCmd.OpenForm frm.Name\n"
+        "    Next\n"
+        "End Sub\n"), None)
+    gb.resolve_dynamic_refs(None)
+    assert {(d["call"], tuple(d["iterates"])) for d in gb.dynamic_refs} == {
+        ("Execute", ("table",)), ("OpenForm", ("form",))}
+    path = os.path.join(str(tmp_path), "graph.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"meta": {"dynamicReferences": gb.dynamic_refs},
+                   "nodes": list(gb.nodes.values()), "edges": gb.edges}, f)
+    assert ac_graph_query("impact", graph_path=path,
+                          node="Customers")["dynamic_references"]["count"] == 1
+    assert "dynamic_references" not in ac_graph_query("impact", graph_path=path,
+                                                      node="qryX")
+
+
+def test_read_column_refuses_non_access_links_and_is_off_by_default():
+    gb = GraphBuilder()
+    gb.add_node("table:tLocal", "tLocal", "table", {"connect": ""}, is_data=True)
+    gb.add_node("table:tBack", "tBack", "table",
+                {"connect": r";DATABASE=\\srv\share\be.accdb"}, is_data=True)
+    gb.add_node("table:tSql", "tSql", "table",
+                {"connect": "ODBC;DRIVER=SQL Server;SERVER=x"}, is_data=True)
+    gb.finalize_data_names()
+    assert gb._reads_only_access("SELECT * FROM tLocal INNER JOIN tBack ON 1=1")
+    assert not gb._reads_only_access("SELECT * FROM tLocal, tSql")
+    assert gb._read_column("tLocal") is None  # read_data is off
