@@ -82,8 +82,7 @@ def _lint_form_modules(app) -> list:
 
     warnings = []
     try:
-        vbe = app.VBE
-        proj = vbe.ActiveVBProject
+        proj = _get_vb_project(app)
         for comp in proj.VBComponents:
             if comp.Type != 100:  # vbext_ct_Document -- Access form/report modules
                 continue
@@ -258,8 +257,7 @@ def _verify_module_structure(app) -> list:
     """
     errors = []
     try:
-        vbe = app.VBE
-        proj = vbe.ActiveVBProject
+        proj = _get_vb_project(app)
         for comp in proj.VBComponents:
             if comp.Type not in (1, 100):  # standard modules + form/report
                 continue
@@ -287,8 +285,7 @@ def _find_block_mismatches(app) -> list:
 
     errors = []
     try:
-        vbe = app.VBE
-        proj = vbe.ActiveVBProject
+        proj = _get_vb_project(app)
         for comp in proj.VBComponents:
             if comp.Type not in (1, 100):  # standard modules + form/report
                 continue
@@ -448,13 +445,13 @@ def _check_blocks_in_module(module_name: str, lines: list, errors: list):
             i += 1
             continue
 
-        if upper == "LOOP" or re.match(r"LOOP\s+(?:WHILE|UNTIL)\s", upper):
+        if re.match(r"LOOP\b", upper):
             if stack and stack[-1][0] == "Do":
                 stack.pop()
             i += 1
             continue
 
-        if upper == "WEND":
+        if re.match(r"WEND\b", upper):
             if stack and stack[-1][0] == "While":
                 stack.pop()
             i += 1

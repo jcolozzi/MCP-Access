@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.7.64
+
+Merges upstream unmateria **v0.7.60 → v0.7.63** into this graph-enabled fork.
+One new tool upstream (`access_search_controls`), so the fork is now **71
+tools** (69 upstream + `access_graph` + `access_graph_query`). The fork's
+0.7.60 version number predates upstream's; this release skips past it.
+
+### Added
+
+- **`access_search_controls`** (upstream v0.7.61) — text/regex search across
+  control properties of every form/report, matching on the **joined** value so
+  a term split across export lines is found. Form-level `RecordSource` /
+  `Filter` / `OrderBy` hits come back with `scope: "form"`.
+- **Continuation-aware VBA search** (upstream v0.7.60) — `access_vbe_find`,
+  `access_vbe_search_all` and `access_find_usages` add `statement_line`,
+  `end_line` and `content_full` when a hit sits inside a ` _`-continued
+  statement. Single-line hits are byte-identical to before.
+- `access_list_controls(fields=[...])`, `access_vbe_search_all(context_lines=N)`,
+  and `caption_text` / `control_source_text` (octal escapes decoded, added only
+  when an escape is present) (upstream v0.7.61).
+
+### Fixed
+
+- **Long control property values are no longer silently truncated**
+  (upstream v0.7.61). `SaveAsText` splits quoted values at 80 characters;
+  `_parse_controls` kept only the first fragment. `helpers.join_wrapped_value`
+  now reassembles them for `access_list_controls`, `access_get_control`, the
+  lint model and `access_find_usages`. This also benefits the dependency
+  graph, which reads `ControlSource` / `RowSource` / `SourceObject` through the
+  same parser — long expressions and inline SQL are now seen whole.
+- **A value ending in its own quote keeps it** (upstream v0.7.62) — delimiters
+  are removed by position instead of `.strip('"')`.
+- **Host databases that reference a library database** (upstream v0.7.63,
+  PR #40) — `VBE.ActiveVBProject` is the *library* right after opening such a
+  host. `_get_vb_project` now matches `CurrentProject.FullName` first, and
+  `access_list_references`, `access_manage_reference` and the remaining
+  `compile.py` checks use it; nothing reads `ActiveVBProject` any more.
+- `Loop` / `Wend` followed by a comment no longer leave a false open block in
+  `access_vbe_check_syntax` / `access_compile_vba` (upstream v0.7.63).
+
+### Preserved
+
+- `graph.py`, `graph_query.py`, `viewer.html`, the graph tool definitions and
+  dispatcher branches, the extra control-parse fields (`source_object`,
+  `row_source`, `link_master_fields`, `link_child_fields`) and the
+  `viewer.html` package-data entry. None of the internal APIs the graph
+  imports changed signature.
+
 ## 0.7.60
 
 Merges upstream unmateria **v0.7.53 → v0.7.59** into this graph-enabled fork.

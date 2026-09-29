@@ -27,7 +27,7 @@ MCP server for reading and editing Microsoft Access databases (`.accdb`/`.mdb`) 
 - **Caches**: `_parsed_controls_cache` (control parsing) and `_Session._cm_cache` (CodeModule COM objects — live COM proxies). Both invalidated on DB switch, object modification, and design operations. There is **no** Python-side cache of VBE text: `_cm_all_code()` always reads via `cm.Lines(1, total)` so external edits (manual VBE edits, Ctrl+Z, add-ins) are picked up immediately. See issue #26 for the reason this cache was removed.
 - **Binary section handling**: `ac_get_code` strips PrtMip/PrtDevMode from form/report exports; `ac_set_code` restores them automatically before import.
 
-## Tools (70 total)
+## Tools (71 total)
 
 | Category | Tools |
 |----------|-------|
@@ -35,7 +35,7 @@ MCP server for reading and editing Microsoft Access databases (`.accdb`/`.mdb`) 
 | **Objects** | `access_list_objects`, `access_get_code`, `access_set_code`, `access_export_structure`, `access_delete_object`, `access_create_form`, `access_build_form`, `access_clone_object` |
 | **SQL/Tables** | `access_execute_sql`, `access_execute_batch`, `access_table_info`, `access_search_queries`, `access_search_data`, `access_create_table`, `access_alter_table` |
 | **VBE line-level** | `access_vbe_get_lines`, `access_vbe_get_proc`, `access_vbe_module_info`, `access_vbe_replace_lines`, `access_vbe_find`, `access_vbe_search_all`, `access_vbe_replace_proc`, `access_vbe_patch_proc`, `access_vbe_append`, `access_vbe_check_syntax` |
-| **Controls** | `access_list_controls`, `access_get_control`, `access_create_control`, `access_delete_control`, `access_set_control_props`, `access_set_multiple_controls`, `access_manage_tab_order` |
+| **Controls** | `access_list_controls`, `access_get_control`, `access_search_controls`, `access_create_control`, `access_delete_control`, `access_set_control_props`, `access_set_multiple_controls`, `access_manage_tab_order` |
 | **UI lint** | `access_lint_form` |
 | **DB Properties** | `access_get_db_property`, `access_set_db_property`, `access_get_form_property`, `access_set_form_property` |
 | **Text Export/Import** | `access_export_text`, `access_import_text` |
@@ -110,6 +110,69 @@ WebBrowser/Navigation* that map yields the **AcControlType** number
 the number that makes a `get_control` → `create_control` round-trip work.
 
 **Depth counter inside a control block must include `Property = Begin`** (e.g. `GUID = Begin`, `NameMap = Begin`, `ConditionalFormat = Begin`). These open multi-line blocks closed by their own `End`. If the parser only counts plain `Begin <Type>` it decrements depth on the closing `End` of the property block without ever incrementing — the control closes prematurely at the first such `End`, and any controls that follow inside a `Page` / `OptionGroup` are silently lost. Fixed in v0.7.34 (was: `re.match(r"^Begin\b", bl_s)` — now also matches `r"^\w+\s*=\s*Begin\s*$"`, mirroring the form-level loop).
+
+### Wrapped property values in the export (v0.7.61)
+
+`SaveAsText` splits any long quoted value across several physical lines, the
+continuation lines being bare quoted literals:
+
+```
+ControlSource ="=FormatPercent(((Nz([a])+Nz([b])-Nz([c]))*1"
+    "00)/Nz([Total])/100)"
+```
+
+The per-line property regex in `_parse_controls` kept only the first fragment
+and dropped the rest **in silence** — no ellipsis, no `truncated` flag. The
+value it returned was a syntactically valid expression that multiplied by one
+instead of a hundred. Same class of defect as the VBA continuation lines fixed
+in v0.7.60, in the other text format this server reads.
+
+`helpers.join_wrapped_value(lines, idx, value)` re-assembles it. Rules baked in:
+
+- **The split is at exactly 80 characters of value per physical line**,
+  measured on Access 2016 (v0.7.62 verification): independent of the property
+  name and of the indentation, counting the export's own escapes. A 72-char
+  value stays on one line; a 92-char one exports as 80 + 12. Do not look for a
+  line-length threshold — there isn't one.
+- **A continuation line is, after `.strip()`, ONLY a quoted literal**
+  (`^"(.*)"\s*$`). At depth 1 inside a control block nothing else has that
+  shape, and the joining path is only entered when the value itself starts
+  with `"` — a number (`Left =1200`) never consumes the following lines.
+- **Fragments concatenate with no separator**, and the delimiting quotes are
+  removed **by position** (`_unquote`), never with `.strip('"')`. Access
+  escapes an embedded quote as `\"` (CR/LF use octal instead — both conventions
+  coexist in one export), so a value ending in one, e.g.
+  `ControlSource ="=\"Ref: \" & [OrderNo]"`, loses its own closing quote to a
+  strip: it chews through both trailing quote characters. That was a live
+  defect of v0.7.60 and earlier, found by running the new parser against a real
+  export in the v0.7.61 verification, and fixed in **v0.7.62** on both paths at
+  once — short and wrapped values used to disagree. `_unquote` falls back to
+  `.strip('"')` only for a value that is not a well-formed quoted literal.
+- **Otherwise an unwrapped value is unchanged from v0.7.60.** Same discipline
+  as v0.7.60: the 99% case gains nothing and costs nothing.
+  `test_control_property_wrap.py` pins the exact key set of an unwrapped
+  control plus the escaped-quote case on both paths.
+- **Depth tracking is untouched**: continuation lines are neither `Begin` nor
+  `End`, so the scan loop advances exactly as before.
+
+Applied in `_parse_controls` (so `access_list_controls`, `access_get_control`
+and the lint model all see whole values) and in `_scan_control_properties`
+(`access_search_controls` + `ac_find_usages`'s `control_matches`).
+
+**NOT applied in `lint._extract_style`** — deliberately. It reads `_STYLE_KEYS`
+only (colours, font names, sizes), values far too short for Access to split.
+The comment there says so; don't propagate the helper where it does nothing.
+
+`raw_block` still carries the value split, exactly as Access wrote it: that is
+the form `LoadFromText` expects back. `caption_text` / `control_source_text`
+(`decode_access_escapes`, octal escapes like `\015\012` and `\042`) are added
+**only when the value actually contains an escape**, for the same
+don't-grow-the-common-case reason.
+
+`_scan_control_properties` resolves each block's `Name` when the block
+**closes**, not when it is read: Access does not guarantee `Name =` precedes
+the property citing it (in practice it usually follows). Nameless control
+blocks report nothing — those are the defaults block's prototypes.
 
 ### VBE + Design view conflict
 After design operations (`ac_set_control_props`, `ac_create_control`, `ac_delete_control`), the form may remain open in Design view. All VBE write functions close the form first (DoCmd.Close with acSaveYes), invalidate `_cm_cache`, then access VBE. Without this: `"Catastrophic failure" (-2147418113)`. All design operations invalidate all three caches in their `finally` block.
@@ -626,6 +689,40 @@ _vbe_line_count(inserted)` so its Check 3 stops being dead code.
 `_vbe_line_count` counts a trailing CRLF as opening a further empty line —
 `"a\r\nb\r\n"` → 3 — because that is what `InsertLines` does.
 
+## Continuation-aware search output (v0.7.60)
+
+Field report by @TvanStiphout-Home: a 64-bit audit read the `Declare` lines that
+`ac_vbe_search_all` returned, found them clean, and missed
+`… As LongPtr) As Long` — the wrong return type was on a continuation line the
+search never returned. The search was reporting the matched **physical** line.
+
+`_join_continuations` now returns `(first, last, text)` triples;
+`_continuation_index(lines)` maps every physical line of a **multi-line only**
+statement to its entry, and `_add_continuation(match, index)` attaches
+`statement_line` / `end_line` / `content_full`. Used by `ac_vbe_find` and
+`ac_vbe_search_all`; `ac_find_usages` copies the three fields through its
+flattening loop (it would otherwise re-hide what `search_all` just surfaced).
+
+- **Only the reporting widened, never the matching.** `text_matches` still runs
+  against the physical line. Matching the joined text instead would change
+  `total_matches` for existing callers and make `max_results` mean something
+  different. Do NOT "improve" this into a logical-line search.
+- **Single-line matches get none of the three fields**, because
+  `_continuation_index` skips statements where `last == first`. That is what
+  keeps the 99% case byte-identical to v0.7.59 and stops a project-wide search
+  from doubling its token cost. Do NOT index every statement "for consistency".
+- **`line` stays the physical hit line.** A hit on a continuation line reports
+  `line: 62, statement_line: 61` — rewriting `line` to the statement start would
+  break every caller that uses it to navigate, and would report a line whose
+  `content` it did not match.
+- **The index is built only for modules that produced a match**, after the match
+  loop. Building it per module up front costs a regex pass over every module in
+  the database to enrich nothing.
+- `content_full` has trailing `'` comments stripped, inherited from
+  `_strip_trailing_vba_comment`. Correct for judging code, wrong for
+  round-tripping source — the schema and `access_tips('vbe')` say so; do not
+  feed `content_full` back into a write.
+
 ## access_vbe_check_syntax (v0.7.52)
 
 The safe alternative to `access_compile_vba`, which is unusable as a post-edit
@@ -768,6 +865,7 @@ the user to **restart** the server (the var is read at startup).
 - `ProcCountLines` can inflate the last proc's count past end of module — always clamp with `min(count, total - start + 1)`
 - Access must be `Visible = True` for VBE COM access to work
 - *"Trust access to the VBA project object model"* must be enabled in Access Trust Center
+- **Never read `VBE.ActiveVBProject`** — use `_get_vb_project(app)`. A referenced library database is loaded into the same `VBProjects` collection, and right after opening the host the active project is the library (measured, Access 2016). `tests/test_referenced_library.py` fails if it comes back (v0.7.63, PR #40).
 
 ### CreateForm via COM shows "Save As" MsgBox
 - **Do NOT** call `CreateForm()` directly followed by `_save_and_close()`.
