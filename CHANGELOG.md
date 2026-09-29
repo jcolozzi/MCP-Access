@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.7.69
+
+**Runtime names, computed table names, and library code.** Fork-only; no new
+tools (still **71**). On Northwind 2 the unresolved dynamic references fell
+from 16 to 2 (both genuinely computed table names), edges grew 1,958 → 2,228,
+still zero warnings. Library code analysis verified live.
+
+### Added
+
+- **Runtime names resolved after the fact** (`resolve_dynamic_refs`, run once
+  every module is read):
+  - *parameters* — through every call site's arguments (positional, named,
+    `Call`, statement form), a caller's own parameter recursively, and
+    `Optional` defaults;
+  - *TempVars* — through every `TempVars!X = ...`, `TempVars.Add` and macro
+    `SetTempVar` (Northwind: `DoCmd.OpenReport TempVars!ReportName` now links
+    to all six reports it can open);
+  - *function results* — through the literals a function assigns to its name.
+  Edges carry `meta.via`; references resolved only partly stay listed with
+  `resolved` and `partial: true`; `stats.resolvedDynamicReferences` counts the
+  rest.
+- **Computed table names in SQL** — `RunSQL`/`Execute`/`OpenRecordset` are now
+  handled line by line in the procedure walker, so concatenated SQL resolves;
+  SQL whose table is a runtime value (`"FROM " & strTable`,
+  `StringFormat("update {0} ...")`) is recorded as a dynamic `data` reference,
+  which `impact` shows for every table and query.
+- **Code inside library databases is analyzed** as the library node: the host
+  tables, forms and fields it uses become edges from the library.
+- **SQL template helpers**: a call whose first argument is a SQL template
+  (`StringFormat("DELETE FROM T WHERE ID={0}", x)`) resolves to the template.
+- `Execute`/`OpenRecordset` naming an object that doesn't exist →
+  `MissingReference`.
+
+### Fixed
+
+- **VBA line numbers** (`30  sql = ...`) hid every statement-start pattern
+  (assignments, `Set`, bare calls, TempVars) in numbered code — common in
+  production error-handling style. They are now blanked with comments.
+- Unknown variables are no longer hinted as function calls.
+
 ## 0.7.68
 
 **Concatenated SQL, re-pointed recordsets, and what lives inside a library.**

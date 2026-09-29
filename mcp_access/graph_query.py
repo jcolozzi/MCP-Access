@@ -252,13 +252,15 @@ def _action_impact(g: _Graph, node_id: str, skip_fields: bool) -> dict:
     }
     group = g.nodes[node_id]["group"]
     dynamic = [d for d in g.meta.get("dynamicReferences", [])
-               if d.get("group") == group]
+               if d.get("group") == group
+               or (d.get("group") == "data" and group in ("table", "query"))]
     if dynamic:
         result["dynamic_references"] = {
             "count": len(dynamic),
-            "note": (f"These places open a {group} whose name is computed at "
-                     "runtime; any of them may also use this node. Inspect "
-                     "them before a rename or delete."),
+            "note": (f"These places use a {group} whose name is only known at "
+                     "runtime (partial ones list what was resolved); any of them "
+                     "may also use this node. Inspect them before a rename or "
+                     "delete."),
             "items": dynamic[:_MAX_DYNAMIC],
         }
     return result

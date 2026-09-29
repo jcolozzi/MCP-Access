@@ -38,8 +38,6 @@ _SQL_START_RE = re.compile(
 _RECORDSOURCE_RE = re.compile(r"^\s+RecordSource\s*=\s*(.*?)\s*$")
 
 # VBA DoCmd / QueryDefs patterns  (case-insensitive, dot-all)
-# Optional "(" and a leading named argument: DoCmd.OpenForm(FormName:="x")
-_DOCMD_ARG = r'\s*\(?\s*(?:\w+\s*:=\s*)?"((?:[^"]|"")+)"'
 # First argument as written: literal, variable or expression (classified later)
 _FIRST_ARG = r'\s*\(?\s*(?:\w+\s*:=\s*)?((?:"(?:[^"]|"")*"|[^,:\n"])+)'
 _VBA_PATTERNS: list[dict[str, str]] = [
@@ -58,6 +56,7 @@ _VBA_PATTERNS: list[dict[str, str]] = [
 ]
 _VBA_EVAL_RE = re.compile(r'\bEval\s*\(\s*"((?:[^"]|"")+)"', re.I)
 _VBA_APP_RUN_RE = re.compile(r'\bApplication\s*\.\s*Run' + _FIRST_ARG, re.I)
+_PATTERN_BY_LABEL = {p["label"]: p for p in _VBA_PATTERNS}
 
 _IDENT_RE = re.compile(r"[A-Za-z_]\w*")
 _STRING_LITERAL_FULL_RE = re.compile(r'"((?:[^"]|"")*)"')
@@ -91,6 +90,30 @@ _CREATE_QDEF_RE = re.compile(
 )
 _ASSIGN_RE = re.compile(r"^[ \t]*(?:Let[ \t]+)?(\w+)[ \t]*=[ \t]*(.+?)[ \t]*$", re.I)
 _CONTINUATION_RE = re.compile(r"[ \t]+_[ \t]*\r?\n[ \t]*")
+# DoCmd.RunSQL x / obj.Execute x / obj.OpenRecordset(x), scanned line by line
+_SQL_CALL_LINE_RE = re.compile(
+    r'(?:\bDoCmd\s*\.\s*(RunSQL)|(?:\b(\w+)\s*(?:\(\s*\))?\s*)?\.\s*(Execute|OpenRecordset))'
+    r'\b\s*\(?\s*(?:\w+\s*:=\s*)?(' + _ARG_BODY + r')',
+    re.I,
+)
+# dbFailOnError, adCmdText, ... passed where a name/SQL is not
+_DB_CONST_RE = re.compile(r"(?:db|ad)[A-Z]\w*")
+# SQL whose table name is a runtime hole: "FROM  ? "
+_TABLE_HOLE_RE = re.compile(r"\b(?:FROM|JOIN|INTO|UPDATE|TABLE)\s+\?", re.I)
+_TEMPVAR_REF = (r'TempVars\s*(?:!\s*(?:\[([^\]]+)\]|(\w+))'
+                r'|(?:\.\s*Item)?\s*\(\s*"([^"]+)"\s*\))(?:\s*\.\s*Value)?')
+_TEMPVAR_REF_RE = re.compile(_TEMPVAR_REF, re.I)
+_TEMPVAR_SET_RE = re.compile(r'^[ \t]*' + _TEMPVAR_REF + r'[ \t]*=[ \t]*(.+?)[ \t]*$',
+                             re.I | re.M)
+_TEMPVAR_ADD_RE = re.compile(
+    r'\bTempVars\s*\.\s*Add\s*\(?\s*"([^"]+)"\s*,\s*(.+?)\s*\)?[ \t]*$', re.I | re.M
+)
+_PROC_HEADER_RE = re.compile(
+    r"^[ \t]*((?:(?:Public|Private|Friend|Static)[ \t]+)*)"
+    r"(Sub|Function|Property[ \t]+(?:Get|Let|Set))[ \t]+(\w+)[ \t]*(?:\((.*)\))?",
+    re.I,
+)
+_PARAM_MODIFIERS_RE = re.compile(r"^(?:(?:Optional|ByVal|ByRef|ParamArray)\s+)+", re.I)
 _ME_RECORDSET_RE = re.compile(r"^Me(?:\s*\.\s*Form)?\s*\.\s*Recordset(?:Clone)?$", re.I)
 _WITH_START_RE = re.compile(r"^[ \t]*With[ \t]+(.+?)[ \t]*$", re.I)
 _END_WITH_RE = re.compile(r"^[ \t]*End[ \t]+With\b", re.I)
@@ -123,13 +146,6 @@ _LIBRARY_META_KEYS = {"table": "tables", "query": "queries", "form": "forms",
 # MSysObjects.Flags: system (0x80000000) or hidden (0x8) — e.g. f_<GUID>_Data
 _MSYS_SKIP_FLAGS = 0x80000008
 
-_VBA_RUNSQL_RE = re.compile(
-    r'\bDoCmd\.RunSQL' + _DOCMD_ARG, re.I | re.S
-)
-# db.Execute "qryX" / "UPDATE ..." and db.OpenRecordset("tbl" | "SELECT ...")
-_VBA_SQL_CALL_RE = re.compile(
-    r'\.\s*(Execute|OpenRecordset)\s*\(?\s*"((?:[^"]|"")+)"', re.I
-)
 _VBA_SOURCEOBJECT_RE = re.compile(
     r'\.SourceObject\s*=\s*"((?:[^"]|"")+)"', re.I | re.M
 )
@@ -282,6 +298,16 @@ class GraphBuilder:
         # References whose target name is computed at runtime (see _record_dynamic)
         self.dynamic_refs: list[dict] = []
         self._dynamic_seen: set[tuple] = set()
+        self.resolved_dynamic = 0
+        # owner id -> comment-stripped VBA, its scope and masked copy (post-pass input)
+        self._analyzed_code: dict[str, str] = {}
+        self._scopes: dict[str, _VbaScope] = {}
+        self._masked: dict[str, str] = {}
+        # (tempvar name, expression) from macro SetTempVar actions
+        self._macro_tempvars: list[tuple[str, str]] = []
+        self._tempvar_cache: dict[str, tuple[set[str], bool]] | None = None
+        # library node id -> VBA sources (standard modules + code-behind)
+        self._library_code: dict[str, list[str]] = {}
         # Public string constants across standard modules: name -> values
         self._global_consts: dict[str, set[str]] = defaultdict(set)
         # (group, name lower) -> library node id, for objects in referenced libraries
@@ -448,8 +474,18 @@ class GraphBuilder:
     def _node_exists(self, node_id: str) -> bool:
         return node_id in self.nodes
 
-    def _resolve_named(self, group: str, name: str) -> str | None:
-        """Node id for a literal object name, or None if it does not exist."""
+    def _resolve_named(
+        self, group: str, name: str, owner_id: str | None = None,
+    ) -> str | None:
+        """Node id for a literal object name, or None if it does not exist.
+
+        Code inside a library opens the library's own forms/reports/macros
+        first, so for a library owner those resolve to the library itself.
+        """
+        if (owner_id and owner_id.startswith("library:")
+                and group in ("form", "report", "macro", "module")
+                and self._library_objects.get((group, name.lower())) == owner_id):
+            return owner_id
         node_id = self._object_id(group, name)
         if self._node_exists(node_id):
             return node_id
@@ -569,12 +605,20 @@ class GraphBuilder:
             via = value
         else:
             if value:
-                self._record_dynamic(owner_id, pat["group"], pat["label"], value)
+                self._record_dynamic(owner_id, pat["group"], pat["label"], value,
+                                     scope, pos)
             return
+        self._link_named_values(owner_id, pat, values, via)
+
+    def _link_named_values(
+        self, owner_id: str, pat: dict, values: list[str], via: str | None,
+    ) -> None:
         for name in values:
             if not name:
                 continue
-            target_id = self._resolve_named(pat["group"], name)
+            target_id = self._resolve_named(pat["group"], name, owner_id)
+            if target_id == owner_id:
+                continue  # a library opening its own object
             meta = {"name": name, **({"via": via} if via else {})}
             if target_id:
                 self.add_edge(owner_id, target_id, pat["label"], pat["kind"],
@@ -594,29 +638,241 @@ class GraphBuilder:
             values = [value]
         else:
             if value:
-                self._record_dynamic(owner_id, "module", "Application.Run", value)
+                self._record_dynamic(owner_id, "module", "Application.Run", value,
+                                     scope, pos)
             return
+        self._link_run_values(owner_id, values, "Application.Run")
+
+    def _link_run_values(self, owner_id: str, values: list[str], via: str) -> None:
         for full in values:
             # "Proc", "Module.Proc" or "Library.Proc"
             proc = full.rsplit(".", 1)[-1]
             for tid in self._proc_index.get(proc.lower(), []):
                 if tid != owner_id:
                     self.add_edge(owner_id, tid, f"calls {proc}", "vba-call",
-                                  "to", {"procedure": proc, "via": "Application.Run"})
+                                  "to", {"procedure": proc, "via": via})
 
     def _record_dynamic(
-        self, owner_id: str, group: str, call: str, expr: str
+        self, owner_id: str, group: str, call: str, expr: str,
+        scope: _VbaScope | None = None, pos: int | None = None,
     ) -> None:
-        """Remember a reference whose target name is only known at runtime."""
+        """Remember a reference whose target name is only known at runtime.
+
+        ``group`` "data" means a table or query. The hint (parameter, TempVar,
+        function result) lets ``resolve_dynamic_refs`` try again once every
+        module has been read.
+        """
         key = (owner_id, group, call, expr)
         if key in self._dynamic_seen:
             return
         self._dynamic_seen.add(key)
         owner = self.nodes.get(owner_id, {})
-        self.dynamic_refs.append({
+        entry = {
             "ownerId": owner_id, "owner": owner.get("label", owner_id),
             "group": group, "call": call, "expr": expr[:120],
-        })
+        }
+        if scope is not None and pos is not None:
+            known = set(self._proc_index) | {
+                p["name"].lower() for p in scope.procs if p and p["kind"] == "function"}
+            entry.update(_dynamic_hint(expr, scope.proc_at(pos), known))
+        self.dynamic_refs.append(entry)
+
+    # ── post-pass: runtime names ────────────────────────────────────────
+
+    def resolve_dynamic_refs(self, sql_dir: str | None) -> None:
+        """Retry runtime names once every module has been read.
+
+        Parameters are resolved through their callers' arguments, TempVars
+        through every assignment (VBA and macro SetTempVar), function calls
+        through the literals the function returns. A reference stays listed
+        (``partial``) unless every path was resolved.
+        """
+        remaining: list[dict] = []
+        for d in self.dynamic_refs:
+            values, complete = self._dynamic_values(d)
+            if values:
+                self._link_dynamic_values(d, sorted(values), sql_dir)
+                d["resolved"] = sorted(values)[:20]
+            if values and complete:
+                self.resolved_dynamic += 1
+                continue
+            if values:
+                d["partial"] = True
+            remaining.append(d)
+        self.dynamic_refs = remaining
+
+    def _dynamic_values(self, d: dict) -> tuple[set[str], bool]:
+        hint = d.get("hint")
+        if hint == "param":
+            return self._param_values(d["ownerId"], d["proc"], d["param"],
+                                      d["paramName"], d.get("default"), 0)
+        if hint == "tempvar":
+            return self._tempvar_values().get(d["tempvar"].lower(), (set(), False))
+        if hint == "function":
+            return self._function_values(d["ownerId"], d["function"])
+        return set(), False
+
+    def _link_dynamic_values(
+        self, d: dict, values: list[str], sql_dir: str | None,
+    ) -> None:
+        via = {
+            "param": f"parameter {d.get('paramName')} of {d.get('proc')}",
+            "tempvar": f"TempVars!{d.get('tempvar')}",
+            "function": f"{d.get('function')}() result",
+        }.get(d.get("hint", ""), d["expr"])
+        owner = d["ownerId"]
+        if d["call"] == "Application.Run":
+            self._link_run_values(owner, values, via)
+        elif d["group"] == "data":
+            for v in values:
+                if _is_likely_sql(v):
+                    sql_id = self._ensure_sql_node(v, f"{owner}:VBA", sql_dir)
+                    self.add_edge(owner, sql_id, d["call"], "vba-runsql", "to",
+                                  {"preview": _preview(v, 80), "via": via})
+                else:
+                    self._link_data_name(owner, v, d["call"])
+        elif d["call"] in _PATTERN_BY_LABEL:
+            self._link_named_values(owner, _PATTERN_BY_LABEL[d["call"]], values, via)
+
+    def _masked_for(self, cid: str) -> tuple[str, str]:
+        """(strings/declarations blanked, continuations joined) copies of owner code."""
+        if cid not in self._masked:
+            joined = _mask_continuations(self._analyzed_code[cid])
+            masked = _VBA_DECL_LINE_RE.sub(lambda m: " " * len(m.group(0)),
+                                           _blank_string_literals(joined))
+            self._masked[cid] = masked
+            self._masked[cid + "\0joined"] = joined
+        return self._masked[cid], self._masked[cid + "\0joined"]
+
+    def _call_sites(
+        self, owner_id: str, info: dict
+    ) -> list[tuple[str, int, tuple[list[str], dict[str, str]]]]:
+        """Every call to ``info``'s procedure: (caller owner, offset, args)."""
+        name = info["name"]
+        if info["public"] and owner_id.split(":", 1)[0] in ("module", "library"):
+            search = list(self._analyzed_code)
+        else:
+            search = [owner_id]
+        pat = re.compile(rf"(?<![.!\w]){re.escape(name)}\b", re.I)
+        sites = []
+        for cid in search:
+            scope = self._scopes.get(cid)
+            if cid != owner_id and scope and any(
+                    p and p["name"].lower() == name.lower() for p in scope.procs):
+                continue  # its own same-named procedure shadows this one
+            masked, joined = self._masked_for(cid)
+            for m in pat.finditer(masked):
+                args = _call_args(joined, m.end())
+                if args is not None:
+                    sites.append((cid, m.start(), args))
+        return sites
+
+    def _param_values(
+        self, owner_id: str, proc_name: str, idx: int, pname: str,
+        default: str | None, depth: int,
+    ) -> tuple[set[str], bool]:
+        """Literals a parameter receives across all call sites (and its default)."""
+        values: set[str] = {default} if default is not None else set()
+        scope = self._scopes.get(owner_id)
+        info = next((p for p in (scope.procs if scope else [])
+                     if p and p["name"].lower() == proc_name.lower()), None)
+        if not info:
+            return values, False
+        sites = self._call_sites(owner_id, info)
+        if not sites:
+            return values, False
+        complete = True
+        for cid, pos, (positional, named) in sites:
+            arg = named.get(pname, positional[idx] if idx < len(positional) else None)
+            if arg is None:
+                complete = complete and default is not None
+                continue
+            kind, val = _classify_arg(arg.strip())
+            if kind == "literal":
+                values.add(val)
+                continue
+            cscope = self._scopes[cid]
+            bindings = cscope.bindings_at(pos)
+            if kind == "variable":
+                if val.lower() in bindings:
+                    values |= bindings[val.lower()]
+                    continue
+                cproc = cscope.proc_at(pos)
+                params = [p for p, _ in (cproc or {}).get("params", [])]
+                if cproc and val.lower() in params and depth < 3:
+                    i2 = params.index(val.lower())
+                    v2, c2 = self._param_values(cid, cproc["name"], i2, val.lower(),
+                                                cproc["params"][i2][1], depth + 1)
+                    values |= v2
+                    complete = complete and c2
+                    continue
+            else:
+                strs = {k: next(iter(v)) for k, v in bindings.items() if len(v) == 1}
+                text = _string_skeleton(arg, strs)
+                if text is not None and _SKELETON_HOLE not in text:
+                    values.add(text)
+                    continue
+            complete = False
+        return values, complete
+
+    def _tempvar_values(self) -> dict[str, tuple[set[str], bool]]:
+        """TempVar name (lower) -> (literal values assigned, all assignments literal)."""
+        if self._tempvar_cache is not None:
+            return self._tempvar_cache
+        vals: dict[str, set[str]] = defaultdict(set)
+        unknown: set[str] = set()
+
+        def add(name: str, rhs: str) -> None:
+            rhs = rhs.strip().replace('\\"', '"')
+            if rhs.startswith("="):
+                rhs = rhs[1:].strip()
+            kind, value = _classify_arg(rhs)
+            if kind == "literal":
+                vals[name.lower()].add(value)
+            else:
+                unknown.add(name.lower())
+
+        for code in self._analyzed_code.values():
+            for m in _TEMPVAR_SET_RE.finditer(code):
+                add(m.group(1) or m.group(2) or m.group(3), m.group(4))
+            for m in _TEMPVAR_ADD_RE.finditer(code):
+                add(m.group(1), m.group(2))
+        for name, expr in self._macro_tempvars:
+            add(name, expr)
+        self._tempvar_cache = {k: (vals.get(k, set()), k not in unknown)
+                               for k in set(vals) | unknown}
+        return self._tempvar_cache
+
+    def _function_values(self, owner_id: str, fname: str) -> tuple[set[str], bool]:
+        """Literals a function returns (assignments to its own name)."""
+        low = fname.lower()
+        scope = self._scopes.get(owner_id)
+        if scope and any(p and p["name"].lower() == low for p in scope.procs):
+            candidates = [owner_id]
+        else:
+            candidates = list(self._proc_index.get(low, []))
+        for cid in candidates:
+            scope, code = self._scopes.get(cid), self._analyzed_code.get(cid)
+            if not scope or code is None:
+                continue
+            for (s, e), info in zip(scope.spans, scope.procs):
+                if not info or info["name"].lower() != low or info["kind"] != "function":
+                    continue
+                strs = {k: next(iter(v)) for k, v in scope.bindings_at(s).items()
+                        if len(v) == 1}
+                rhs_all = re.findall(
+                    rf"^[ \t]*{re.escape(info['name'])}[ \t]*=[ \t]*(.+?)[ \t]*$",
+                    _mask_continuations(code[s:e]), re.I | re.M)
+                values: set[str] = set()
+                complete = bool(rhs_all)
+                for rhs in rhs_all:
+                    text = _resolve_string(rhs.strip(), strs)
+                    if text is not None and _SKELETON_HOLE not in text:
+                        values.add(text)
+                    else:
+                        complete = False
+                return values, complete
+        return set(), False
 
     # ── recordset / Me field references ─────────────────────────────────
 
@@ -677,9 +933,12 @@ class GraphBuilder:
 
     def _link_recordset_fields(
         self, owner_id: str, code: str, scope: _VbaScope, me_source: dict | None,
+        sql_dir: str | None = None, origin: str | None = None,
     ) -> None:
         """Walk each procedure in order so every field read is attributed to the
-        source its recordset points at on that line."""
+        source its recordset points at on that line, and every SQL call sees the
+        string its variables hold on that line."""
+        origin = origin or f"{owner_id}:VBA"
         for start, end in scope.spans:
             body = _CONTINUATION_RE.sub(" ", code[start:end])
             strs = {k: next(iter(v)) for k, v in scope.bindings_at(start).items()
@@ -689,6 +948,8 @@ class GraphBuilder:
             objs: dict[str, tuple | None] = {}
             with_stack: list[tuple[str, tuple | None]] = []
             for line in body.splitlines():
+                self._scan_sql_calls(owner_id, line, strs, objs, scope, start,
+                                     sql_dir, origin)
                 m = _SET_RE.match(line)
                 if m:
                     var, rhs = m.group(1).lower(), m.group(2)
@@ -736,6 +997,43 @@ class GraphBuilder:
                         fname = f.group(1) or f.group(2) or f.group(3)
                         self._link_vba_field(owner_id, src, fname,
                                              f"With {target}: !{fname}")
+
+    def _scan_sql_calls(
+        self, owner_id: str, line: str, strs: dict[str, str],
+        objs: dict[str, tuple | None], scope: _VbaScope, proc_start: int,
+        sql_dir: str | None, origin: str,
+    ) -> None:
+        """DoCmd.RunSQL / .Execute / .OpenRecordset with a name or SQL on one line."""
+        for m in _SQL_CALL_LINE_RE.finditer(line):
+            label = "RunSQL" if m.group(1) else m.group(3)
+            if (m.group(2) or "").lower() in objs:
+                continue  # qdf.Execute / qdf.OpenRecordset: handled via the QueryDef
+            arg = _clean_arg(m.group(4))
+            if not arg or _DB_CONST_RE.fullmatch(arg):
+                continue
+            value = _resolve_string(arg, strs)
+            if value is None:
+                self._record_dynamic(owner_id, "data", label, arg, scope, proc_start)
+                continue
+            if _is_likely_sql(value):
+                sql_id = self._ensure_sql_node(value, origin, sql_dir)
+                self.add_edge(owner_id, sql_id, label, "vba-runsql", "to",
+                              {"preview": _preview(value, 80)})
+                if _TABLE_HOLE_RE.search(value):
+                    self._record_dynamic(owner_id, "data", label, arg, scope,
+                                         proc_start)
+                continue
+            self._link_data_name(owner_id, value, label)
+
+    def _link_data_name(self, owner_id: str, name: str, label: str) -> None:
+        targets = self._targets_for_name(name, data_only=True)
+        for t in targets:
+            self.add_edge(owner_id, t["node_id"], label, "vba-data-ref", "to",
+                          {"name": name})
+        if not targets:
+            self._warn_missing(owner_id,
+                               "query" if label == "Execute" else "table or query",
+                               name, f"VBA {label}")
 
     def _link_vba_field(
         self, owner_id: str, src: tuple, fname: str, via: str, *, warn: bool = True,
@@ -1129,7 +1427,21 @@ class GraphBuilder:
             self.index_module_procs(lib_id, code)
             for k, v in _public_consts(code).items():
                 self._global_consts[k] |= v
+        self._library_code[lib_id] = [
+            *comps["modules"].values(), *comps.get("code_behind", {}).values()]
         return lib_id
+
+    def analyze_library_code(self, sql_dir: str | None) -> None:
+        """Analyze each library's VBA as the library node.
+
+        Library code runs against the host (CurrentDb) for data, so it can
+        depend on host tables/queries; that is what this surfaces.
+        """
+        for lib_id, sources in self._library_code.items():
+            code = "\n".join(s for s in sources if s)
+            if code:
+                self._analyze_code_heuristics(
+                    lib_id, "library", self.nodes[lib_id]["label"], code, sql_dir)
 
     def index_module_procs(
         self, node_id: str, code: str, *, is_class: bool = False
@@ -1436,6 +1748,10 @@ class GraphBuilder:
             return
         code = _strip_vba_comments(code)
         scope = _VbaScope(code, self._global_consts)
+        self._analyzed_code[owner_id] = code
+        self._scopes[owner_id] = scope
+        # Library code cannot see host procedures or classes by name.
+        is_library = owner_id.startswith("library:")
 
         # DoCmd / QueryDefs: literal, variable/constant, or runtime expression
         for pat in _VBA_PATTERNS:
@@ -1450,39 +1766,11 @@ class GraphBuilder:
         for m in _VBA_APP_RUN_RE.finditer(code):
             self._handle_app_run(owner_id, m.group(1), scope, m.start())
 
-        # Recordset and Me field references
-        self._link_recordset_fields(owner_id, code, scope, me_source)
+        # Recordsets, Me fields, and RunSQL/Execute/OpenRecordset (walked in order)
+        self._link_recordset_fields(owner_id, code, scope, me_source, sql_dir,
+                                    f"{owner_group}:{owner_name}:VBA")
         if me_source:
             self._link_me_fields(owner_id, code, me_source, me_controls)
-
-        # DoCmd.RunSQL
-        for m in _VBA_RUNSQL_RE.finditer(code):
-            sql_text = m.group(1).replace('""', '"')
-            if not sql_text:
-                continue
-            sql_id = self._ensure_sql_node(
-                sql_text,
-                f"{owner_group}:{owner_name}:VBA",
-                sql_dir,
-            )
-            self.add_edge(owner_id, sql_id, "RunSQL", "vba-runsql", "to",
-                          {"preview": _preview(sql_text, 80)})
-
-        # db.Execute / db.OpenRecordset with a saved query/table name or SQL
-        for m in _VBA_SQL_CALL_RE.finditer(code):
-            method = m.group(1)
-            arg = m.group(2).replace('""', '"').strip()
-            if not arg:
-                continue
-            if _is_likely_sql(arg):
-                sql_id = self._ensure_sql_node(
-                    arg, f"{owner_group}:{owner_name}:VBA", sql_dir)
-                self.add_edge(owner_id, sql_id, method, "vba-runsql", "to",
-                              {"preview": _preview(arg, 80)})
-                continue
-            for t in self._targets_for_name(arg, data_only=True):
-                self.add_edge(owner_id, t["node_id"], method, "vba-data-ref",
-                              "to", {"name": arg})
 
         # Forms!frm!ctl, Forms("frm"), Reports!rpt
         self._link_object_refs(owner_id, code, {"via": "VBA"}, vba=True)
@@ -1503,7 +1791,7 @@ class GraphBuilder:
 
         # Type dependencies (As ClassName, New ClassName, ClassName.)
         seen_type: set[str] = set()
-        for lname, entries in self._name_targets.items():
+        for lname, entries in ([] if is_library else self._name_targets.items()):
             for entry in entries:
                 if entry["group"] != "module":
                     continue
@@ -1526,7 +1814,7 @@ class GraphBuilder:
                         )
 
         # Cross-module procedure calls: Foo(, Call Foo, or Foo a, b
-        if self._proc_call_re:
+        if self._proc_call_re and not is_library:
             # A same-named procedure in this module shadows the public one.
             local = {
                 m.group(1).lower()
@@ -1660,15 +1948,18 @@ class GraphBuilder:
                 i += 1
                 continue
             action = m_act.group(1)
-            arg_value: str | None = None
-            for j in range(i + 1, min(i + 8, len(lines))):
+            args: list[str | None] = []
+            for j in range(i + 1, min(i + 12, len(lines))):
                 if _MACRO_ACTION_RE.match(lines[j]):
                     break
                 m_arg = _MACRO_ARGUMENT_RE.match(lines[j])
                 if m_arg:
-                    arg_value = _convert_access_literal(m_arg.group(1))
-                    break
+                    args.append(_convert_access_literal(m_arg.group(1)))
             i += 1
+            arg_value = args[0] if args else None
+            if action == "SetTempVar" and len(args) >= 2 and args[0] and args[1]:
+                self._macro_tempvars.append((args[0], args[1]))
+                self._tempvar_cache = None
             if not arg_value:
                 continue
 
@@ -1801,6 +2092,7 @@ class GraphBuilder:
             "fieldNodes": groups.get("field", 0),
             "libraries": groups.get("library", 0),
             "dynamicReferences": len(self.dynamic_refs),
+            "resolvedDynamicReferences": self.resolved_dynamic,
             "warnings": len(self.warnings),
         }
 
@@ -1846,19 +2138,24 @@ def _library_components(proj: Any) -> dict | None:
 
     None when the project cannot be read (locked or compiled-only).
     """
-    out: dict[str, Any] = {"forms": [], "reports": [], "modules": {}}
+    out: dict[str, Any] = {"forms": [], "reports": [], "modules": {},
+                           "code_behind": {}}
     try:
         for comp in proj.VBComponents:
             cname = str(comp.Name)
             ctype = int(comp.Type)
-            if ctype == 100 and cname.startswith("Form_"):
-                out["forms"].append(cname[5:])
-            elif ctype == 100 and cname.startswith("Report_"):
-                out["reports"].append(cname[7:])
-            elif ctype == 1:  # vbext_ct_StdModule
+            if ctype in (1, 100):  # vbext_ct_StdModule, vbext_ct_Document
                 cm = comp.CodeModule
                 n = int(cm.CountOfLines)
-                out["modules"][cname] = str(cm.Lines(1, n)) if n else ""
+                code = str(cm.Lines(1, n)) if n else ""
+            if ctype == 100 and cname.startswith("Form_"):
+                out["forms"].append(cname[5:])
+                out["code_behind"][cname] = code
+            elif ctype == 100 and cname.startswith("Report_"):
+                out["reports"].append(cname[7:])
+                out["code_behind"][cname] = code
+            elif ctype == 1:
+                out["modules"][cname] = code
     except Exception:
         return None
     return out
@@ -1937,14 +2234,21 @@ def _safe_attr(obj: Any, name: str) -> str:
 
 
 _REM_RE = re.compile(r"^\s*Rem(\s|$)", re.I)
+# A VBA line number ("30  sql = ..."); not on a continuation line, where a
+# leading number is an operand.
+_LINE_NUMBER_RE = re.compile(r"^[ \t]*\d+(?=[ \t])")
 
 
 def _strip_vba_comments(code: str) -> str:
-    """Blank out VBA comments, keeping line count and string literals intact."""
+    """Blank out VBA comments and line numbers, keeping line count and literals."""
     out: list[str] = []
+    continued = False
     for line in code.splitlines():
+        if not continued:
+            line = _LINE_NUMBER_RE.sub(lambda m: " " * len(m.group(0)), line)
         if _REM_RE.match(line):
             out.append("")
+            continued = False
             continue
         in_str = False
         cut = len(line)
@@ -1955,6 +2259,7 @@ def _strip_vba_comments(code: str) -> str:
                 cut = i
                 break
         out.append(line[:cut])
+        continued = line[:cut].rstrip().endswith(" _")
     return "\n".join(out)
 
 
@@ -2017,26 +2322,40 @@ def _split_concat(expr: str) -> list[str]:
 
 # Stands in for a runtime value inside a concatenated string.
 _SKELETON_HOLE = " ? "
+_CALL_PART_RE = re.compile(r"^[A-Za-z_][\w.]*\s*\((.*)\)$", re.S)
+_FORMAT_SLOT_RE = re.compile(r"\{\d+\}")
 
 
 def _string_skeleton(expr: str, strs: dict[str, str]) -> str | None:
     """Static text of a string expression, runtime parts replaced by a hole.
 
     ``"SELECT * FROM T WHERE ID=" & lngID`` -> ``SELECT * FROM T WHERE ID= ? ``.
+    A call whose first argument is a SQL template (``StringFormat("DELETE FROM T
+    WHERE ID={0}", x)``, ``Replace(strSQL, ...)``) stands for that template.
     None when no part is a literal or a variable already holding text.
     """
     out: list[str] = []
     known = False
     for part in _split_concat(expr):
-        kind, value = _classify_arg(part.strip())
+        part = part.strip()
+        kind, value = _classify_arg(part)
         if kind == "literal":
             out.append(value)
             known = True
-        elif kind == "variable" and value.lower() in strs:
+            continue
+        if kind == "variable" and value.lower() in strs:
             out.append(strs[value.lower()])
             known = True
-        else:
-            out.append(_SKELETON_HOLE)
+            continue
+        m = _CALL_PART_RE.match(part)
+        if m:
+            first = _split_args(m.group(1))[0]
+            template = _resolve_string(first, strs) if first else None
+            if template and _is_likely_sql(template):
+                out.append(_FORMAT_SLOT_RE.sub(_SKELETON_HOLE, template))
+                known = True
+                continue
+        out.append(_SKELETON_HOLE)
     return "".join(out) if known else None
 
 
@@ -2048,6 +2367,132 @@ def _resolve_string(arg: str, strs: dict[str, str]) -> str | None:
     if kind == "variable":
         return strs.get(value.lower())
     return _string_skeleton(arg, strs)
+
+
+def _split_args(text: str) -> list[str]:
+    """Split an argument list on top-level commas (outside strings/parens)."""
+    parts: list[str] = []
+    depth = 0
+    in_str = False
+    cur: list[str] = []
+    for ch in text:
+        if ch == '"':
+            in_str = not in_str
+        elif not in_str:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            elif ch == "," and depth == 0:
+                parts.append("".join(cur).strip())
+                cur = []
+                continue
+        cur.append(ch)
+    parts.append("".join(cur).strip())
+    return parts
+
+
+def _mask_continuations(code: str) -> str:
+    """Join ' _' continuations with spaces of equal length (offsets unchanged)."""
+    return _CONTINUATION_RE.sub(lambda m: " " * len(m.group(0)), code)
+
+
+def _parse_proc_header(code: str, start: int) -> dict | None:
+    """{name, kind, public, params: [(name lower, default literal | None)]}."""
+    header = _mask_continuations(code[start:start + 4000]).split("\n", 1)[0]
+    m = _PROC_HEADER_RE.match(header)
+    if not m:
+        return None
+    params: list[tuple[str, str | None]] = []
+    for p in _split_args(m.group(4) or ""):
+        p = _PARAM_MODIFIERS_RE.sub("", p)
+        name = _IDENT_RE.match(p)
+        if not name:
+            continue
+        default = re.search(r'=\s*"((?:[^"]|"")*)"\s*$', p)
+        params.append((name.group(0).lower(),
+                       default.group(1).replace('""', '"') if default else None))
+    return {
+        "name": m.group(3),
+        "kind": m.group(2).split()[0].lower(),
+        "public": "private" not in m.group(1).lower(),
+        "params": params,
+    }
+
+
+def _dynamic_hint(expr: str, proc: dict | None, known_procs: set[str]) -> dict:
+    """How a runtime name might still be resolved: parameter, TempVar or function."""
+    expr = expr.strip()
+    m = _TEMPVAR_REF_RE.fullmatch(expr)
+    if m:
+        return {"hint": "tempvar", "tempvar": m.group(1) or m.group(2) or m.group(3)}
+    kind, value = _classify_arg(expr)
+    if kind == "variable":
+        for i, (param, default) in enumerate((proc or {}).get("params", [])):
+            if param == value.lower():
+                hint = {"hint": "param", "proc": proc["name"], "param": i,
+                        "paramName": param}
+                if default is not None:
+                    hint["default"] = default
+                return hint
+        if value.lower() in known_procs:  # a Function called without parentheses
+            return {"hint": "function", "function": value}
+        return {"hint": "variable"}
+    m = re.fullmatch(r"([A-Za-z_]\w*)\s*\(.*\)", expr, re.S)
+    if m and m.group(1).lower() in known_procs:
+        return {"hint": "function", "function": m.group(1)}
+    return {}
+
+
+def _call_args(code: str, pos: int) -> tuple[list[str], dict[str, str]] | None:
+    """Arguments of the call whose procedure name ends at ``pos``.
+
+    Handles ``Foo(a, b)`` and statement form ``Foo a, b``; named arguments
+    (``x:=v``) come back in the dict. None when the name is not a call (an
+    assignment target, a member access). ``code`` must have continuations
+    masked.
+    """
+    n = len(code)
+    i = pos
+    while i < n and code[i] in " \t":
+        i += 1
+    if i < n and code[i] in "=.!":
+        return None
+    if i < n and code[i] == "(":
+        depth, in_str, j = 0, False, i
+        while j < n:
+            ch = code[j]
+            if ch == '"':
+                in_str = not in_str
+            elif not in_str and ch == "(":
+                depth += 1
+            elif not in_str and ch == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            elif ch == "\n":
+                break
+            j += 1
+        inner = code[i + 1:j]
+    else:
+        in_str, j = False, i
+        while j < n and code[j] != "\n":
+            if code[j] == '"':
+                in_str = not in_str
+            elif not in_str and code[j] == ":" and code[j + 1:j + 2] != "=":
+                break
+            j += 1
+        inner = code[i:j]
+    positional: list[str] = []
+    named: dict[str, str] = {}
+    if inner.strip():
+        for part in _split_args(inner):
+            m = re.match(r"(\w+)\s*:=\s*(.*)$", part, re.S)
+            if m:
+                named[m.group(1).lower()] = m.group(2).strip()
+            else:
+                positional.append(part)
+    return positional, named
 
 
 def _proc_spans(code: str) -> list[tuple[int, int]]:
@@ -2099,7 +2544,15 @@ class _VbaScope:
             outside = outside[:s] + "\n" * code.count("\n", s, e) + outside[e:]
         self._module = _string_bindings(outside)
         self._procs = [_string_bindings(code[s:e]) for s, e in self.spans]
+        self.procs = [_parse_proc_header(code, s) for s, _ in self.spans]
         self._global = global_consts
+
+    def proc_at(self, pos: int) -> dict | None:
+        """Header info of the procedure containing ``pos``."""
+        for (s, e), info in zip(self.spans, self.procs):
+            if s <= pos < e:
+                return info
+        return None
 
     def bindings_at(self, pos: int) -> dict[str, set[str]]:
         merged: dict[str, set[str]] = defaultdict(set)
@@ -2469,6 +2922,11 @@ def ac_graph(
     # including those skipped above when heuristics were disabled.
     if raw_export_mode == "debug":
         gb.export_raw_remaining(db_path, obj_list)
+
+    if include_code_heuristics:
+        gb.analyze_library_code(sql_dir)
+    # Needs every module read: parameters resolve through their callers.
+    gb.resolve_dynamic_refs(sql_dir)
 
     # Snapshot last: the stamps must describe the design the graph was built from.
     try:

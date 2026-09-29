@@ -528,10 +528,12 @@ def test_vba_execute_openrecordset_and_forms_refs():
     gb = _builder_with("module:m", "query:qryAppend", "form:frmA")
     gb.finalize_data_names()
     code = (
-        'CurrentDb.Execute "qryAppend", dbFailOnError\n'
-        'Set rs = db.OpenRecordset("SELECT * FROM qryAppend")\n'
-        'Forms("frmA").Requery\n'
-        'x = Forms!frmGone!txtA\n'
+        "Sub A()\n"
+        '    CurrentDb.Execute "qryAppend", dbFailOnError\n'
+        '    Set rs = db.OpenRecordset("SELECT * FROM qryAppend")\n'
+        '    Forms("frmA").Requery\n'
+        '    x = Forms!frmGone!txtA\n'
+        "End Sub\n"
     )
     gb._analyze_code_heuristics("module:m", "module", "m", code, None)
     assert [e["to"] for e in _edges(gb, "vba-data-ref")
@@ -747,7 +749,10 @@ def test_repointed_recordset_is_not_attributed():
         "End Sub\n"
     )
     gb._analyze_code_heuristics("module:m", "module", "m", code, None)
-    assert _edges(gb, "vba-field") == [] and gb.warnings == []
+    assert _edges(gb, "vba-field") == []
+    # The unknown source is itself reported; rs!Fax is not guessed at.
+    assert [(w["code"], w["meta"]["target"]) for w in gb.warnings] == [
+        ("MissingReference", "SomethingElse")]
 
 
 def test_me_fields_and_recordsetclone_in_form_code():
@@ -925,3 +930,219 @@ def test_querydef_variables_feed_recordsets():
     assert _vba_fields(gb) == {"field:query:qryCust:Phone",
                                "field:table:Customers:ID"}
     assert gb.warnings == []
+
+
+# ---------------------------------------------------------------------------
+# runtime names resolved after the fact: parameters, TempVars, function results
+# ---------------------------------------------------------------------------
+
+def _opened(gb: GraphBuilder, kind: str = "vba-openform") -> set[tuple[str, str]]:
+    return {(e["to"], e["meta"].get("via", "")) for e in _edges(gb, kind)}
+
+
+def test_parameter_resolved_through_all_callers():
+    gb = _builder_with("module:modNav", "module:modMain", "form:frmHome",
+                       "form:frmA", "form:frmB", "form:frmC", "form:frmD")
+    gb._analyze_code_heuristics("module:modNav", "module", "modNav", (
+        "Public Sub OpenScreen(frmName As String, Optional mode As Long = 0)\n"
+        "    DoCmd.OpenForm frmName\n"
+        "End Sub\n"
+        "Public Sub Wrapper(ByVal f As String)\n"
+        "    OpenScreen f\n"
+        "End Sub\n"), None)
+    gb._analyze_code_heuristics("module:modMain", "module", "modMain", (
+        "Sub Go()\n"
+        '    Call OpenScreen("frmB")\n'
+        '    OpenScreen frmName:="frmC", mode:=1\n'
+        '    Wrapper "frmD"\n'
+        "End Sub\n"), None)
+    gb._analyze_code_heuristics("form:frmHome", "form", "frmHome", (
+        "Private Sub cmdA_Click()\n"
+        '    OpenScreen "frmA"\n'
+        "End Sub\n"), None)
+    assert len(gb.dynamic_refs) == 1
+    gb.resolve_dynamic_refs(None)
+    via = "parameter frmname of OpenScreen"
+    assert _opened(gb) == {(f"form:{f}", via) for f in ("frmA", "frmB", "frmC", "frmD")}
+    assert gb.dynamic_refs == [] and gb.resolved_dynamic == 1
+    assert all(e["from"] == "module:modNav" for e in _edges(gb, "vba-openform"))
+
+
+def test_parameter_partly_resolved_stays_listed():
+    gb = _builder_with("module:m", "form:frmA")
+    gb._analyze_code_heuristics("module:m", "module", "m", (
+        "Private Sub Show(f As String)\n"
+        "    DoCmd.OpenForm f\n"
+        "End Sub\n"
+        "Sub Go()\n"
+        '    Show "frmA"\n'
+        "    Show rs!FormName\n"
+        "End Sub\n"), None)
+    gb.resolve_dynamic_refs(None)
+    assert _opened(gb) == {("form:frmA", "parameter f of Show")}
+    [d] = gb.dynamic_refs
+    assert d["partial"] is True and d["resolved"] == ["frmA"]
+
+
+def test_optional_parameter_default_is_used():
+    gb = _builder_with("module:m", "form:frmDefault")
+    gb._analyze_code_heuristics("module:m", "module", "m", (
+        'Private Sub Show(Optional f As String = "frmDefault")\n'
+        "    DoCmd.OpenForm f\n"
+        "End Sub\n"
+        "Sub Go()\n"
+        "    Show\n"
+        "End Sub\n"), None)
+    gb.resolve_dynamic_refs(None)
+    assert _opened(gb) == {("form:frmDefault", "parameter f of Show")}
+    assert gb.dynamic_refs == []
+
+
+def test_tempvars_resolved_from_vba_and_macros():
+    gb = _builder_with("module:m1", "module:m2", "form:frmReports", "macro:mcrInit",
+                       "report:rptA", "report:rptB", "report:rptC")
+    gb._analyze_code_heuristics("module:m1", "module", "m1",
+                                'Sub A()\n    TempVars!ReportName = "rptA"\nEnd Sub\n', None)
+    gb._analyze_code_heuristics("module:m2", "module", "m2",
+                                'Sub B()\n    TempVars.Add "ReportName", "rptB"\nEnd Sub\n', None)
+    gb._analyze_macro_lines("macro:mcrInit", [
+        'Action ="SetTempVar"', 'Argument ="ReportName"', 'Argument ="\\"rptC\\""'], None)
+    gb._analyze_code_heuristics("form:frmReports", "form", "frmReports", (
+        "Private Sub cmdPreview_Click()\n"
+        "    DoCmd.OpenReport TempVars!ReportName, acViewPreview\n"
+        "End Sub\n"), None)
+    gb.resolve_dynamic_refs(None)
+    assert _opened(gb, "vba-openreport") == {
+        (f"report:{r}", "TempVars!ReportName") for r in ("rptA", "rptB", "rptC")}
+    assert gb.dynamic_refs == []
+
+
+def test_tempvar_assigned_a_runtime_value_is_partial():
+    gb = _builder_with("module:m", "report:rptA")
+    gb._analyze_code_heuristics("module:m", "module", "m", (
+        "Sub A()\n"
+        '    TempVars!R = "rptA"\n'
+        "    TempVars!R = Me.lstReports\n"
+        "    DoCmd.OpenReport TempVars!R\n"
+        "End Sub\n"), None)
+    gb.resolve_dynamic_refs(None)
+    assert _opened(gb, "vba-openreport") == {("report:rptA", "TempVars!R")}
+    assert gb.dynamic_refs[0]["partial"] is True
+
+
+def test_function_result_is_resolved():
+    gb = _builder_with("module:modCfg", "module:m", "form:frmA", "form:frmB")
+    gb.index_module_procs("module:modCfg", "Public Function StartForm() As String\nEnd Function\n")
+    gb._analyze_code_heuristics("module:modCfg", "module", "modCfg", (
+        "Public Function StartForm() As String\n"
+        "    If IsAdmin Then\n"
+        '        StartForm = "frmA"\n'
+        "    Else\n"
+        '        StartForm = "frmB"\n'
+        "    End If\n"
+        "End Function\n"), None)
+    gb._analyze_code_heuristics("module:m", "module", "m",
+                                "Sub Go()\n    DoCmd.OpenForm StartForm()\nEnd Sub\n", None)
+    gb.resolve_dynamic_refs(None)
+    assert _opened(gb) == {("form:frmA", "StartForm() result"),
+                           ("form:frmB", "StartForm() result")}
+    assert gb.dynamic_refs == []
+
+
+# ---------------------------------------------------------------------------
+# SQL with a computed table name; parameters feeding SQL calls
+# ---------------------------------------------------------------------------
+
+def test_computed_table_name_is_a_dynamic_data_reference(tmp_path):
+    gb = _rs_builder()
+    gb._analyze_code_heuristics("module:m", "module", "m", (
+        "Sub A(strTable As String)\n"
+        '    Set rs = db.OpenRecordset("SELECT * FROM " & strTable)\n'
+        '    CurrentDb.Execute "DELETE FROM " & strTable & " WHERE Old"\n'
+        "End Sub\n"), None)
+    assert {(d["group"], d["call"]) for d in gb.dynamic_refs} == {
+        ("data", "OpenRecordset"), ("data", "Execute")}
+    path = os.path.join(str(tmp_path), "graph.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"meta": {"dynamicReferences": gb.dynamic_refs},
+                   "nodes": list(gb.nodes.values()), "edges": gb.edges}, f)
+    r = ac_graph_query("impact", graph_path=path, node="Customers")
+    assert r["dynamic_references"]["count"] == 2
+
+
+def test_sql_variable_parameter_resolves_to_query():
+    gb = _builder_with("module:m", "query:qryAppend")
+    gb.finalize_data_names()
+    gb._analyze_code_heuristics("module:m", "module", "m", (
+        "Private Sub Run(strSQL As String)\n"
+        "    CurrentDb.Execute strSQL, dbFailOnError\n"
+        "End Sub\n"
+        "Sub Go()\n"
+        '    Run "qryAppend"\n'
+        "End Sub\n"), None)
+    gb.resolve_dynamic_refs(None)
+    assert [e["to"] for e in _edges(gb, "vba-data-ref")
+            if e["label"] == "Execute"] == ["query:qryAppend"]
+    assert gb.dynamic_refs == []
+
+
+def test_concatenated_execute_links_sql_node_and_tables():
+    gb = _rs_builder()
+    gb._analyze_code_heuristics("module:m", "module", "m", (
+        "Sub A(id As Long)\n"
+        '    s = "UPDATE Customers SET Phone = Null "\n'
+        '    s = s & "WHERE ID = " & id\n'
+        "    DoCmd.RunSQL s\n"
+        "End Sub\n"), None)
+    [sql_edge] = _edges(gb, "vba-runsql")
+    assert sql_edge["label"] == "RunSQL"
+    assert any(e["to"] == "table:Customers" and e["from"] == sql_edge["to"]
+               for e in _edges(gb, "sql-reference"))
+    assert gb.dynamic_refs == []
+
+
+def test_numbered_lines_and_sql_template_helpers():
+    gb = _rs_builder()
+    gb._analyze_code_heuristics("module:m", "module", "m", (
+        "Sub A(id As Long, tbl As String)\n"
+        '10    sql = StringFormatSQL("delete * from Customers where ID = {0}", id)\n'
+        "20    g_dbApp.Execute sql, dbFailOnError\n"
+        '30    sql = StringFormat("update {0} set Flag = 1", tbl)\n'
+        "40    g_dbApp.Execute sql, dbFailOnError\n"
+        '50    Set rs = g_dbApp.OpenRecordset("Customers")\n'
+        "60    x = rs!Phone\n"
+        "End Sub\n"), None)
+    previews = {e["meta"]["preview"] for e in _edges(gb, "vba-runsql")}
+    assert "delete * from Customers where ID = ?" in previews
+    assert _vba_fields(gb) == {"field:table:Customers:Phone"}
+    # Only the template with a computed table name stays dynamic.
+    assert [d["expr"] for d in gb.dynamic_refs] == ["sql"]
+    assert gb.dynamic_refs[0]["hint"] == "variable"
+
+
+# ---------------------------------------------------------------------------
+# code inside a library
+# ---------------------------------------------------------------------------
+
+def test_library_code_depends_on_host_objects_only():
+    gb = _builder_with("table:Customers", "form:frmHost", "module:modHost")
+    gb.index_module_procs("module:modHost", "Public Sub HostOnly()\nEnd Sub\n")
+    gb.finalize_data_names()
+    lib = gb.add_library("NWLib", r"C:\libs\NWLib.accda", {
+        "forms": ["frmLibOwn"], "reports": [], "code_behind": {},
+        "modules": {"modLib": (
+            "Public Sub LibRun()\n"
+            '    DoCmd.OpenForm "frmLibOwn"\n'
+            '    DoCmd.OpenForm "frmHost"\n'
+            '    Set rs = CurrentDb.OpenRecordset("Customers")\n'
+            "    HostOnly\n"
+            "End Sub\n")},
+    })
+    gb._compile_proc_call_re()
+    gb.analyze_library_code(None)
+    out = {(e["kind"], e["to"]) for e in gb.edges if e["from"] == lib}
+    assert ("vba-openform", "form:frmHost") in out
+    assert ("vba-data-ref", "table:Customers") in out
+    assert all(to != lib for _, to in out)                 # own form: no self edge
+    assert ("vba-call", "module:modHost") not in out       # can't call host code
+    assert _missing(gb) == []
