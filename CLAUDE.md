@@ -321,12 +321,17 @@ Pure-Python tool that loads `graph.json` and answers targeted questions without 
 | `impact` | Transitive dependents — what breaks if this changes. Walks edges backwards (they point consumer → dependency) and descends through a table/query's field nodes; each hit has `depth` | `node` |
 | `path` | Shortest path between two nodes (undirected BFS) | `source`, `target` |
 | `orphans` | Nodes with zero incoming edges (dead objects) | — |
+| `broken` | Build warnings — `MissingReference` (literal name of an object that doesn't exist), `UnresolvedRecordSource`, export failures | `node` = plain-text owner/target filter (works for deleted objects) |
 
 Node resolution: accepts exact ids (`table:Customers`), bare names (`Customers`), or `group:name` format. Raises if ambiguous.
 
 `skip_fields=true` (default) excludes `field-owner` edges to reduce noise. Results capped at 200 items.
 
-**Recommended agent workflow**: run `access_graph` once, then use `access_graph_query` for targeted lookups before any mutation.
+Every result carries `graph: {generatedAt, stale}`. `stale` compares the `.accdb` mtime to `meta.databaseMtime` recorded at build time (server-side file times, so no clock skew); any design **or data** write trips it. `null` for graphs built before 0.7.65.
+
+`MissingReference` is emitted only for **literal** names (VBA `DoCmd.Open*`/`RunMacro`/`QueryDefs("x")`/`.SourceObject =`, control SourceObject, macro actions). VBA is comment-stripped (`_strip_vba_comments`) before any heuristic runs, so commented-out code creates neither edges nor warnings. Macro arguments starting with `=` are expressions and are skipped.
+
+**Recommended agent workflow**: run `access_graph` once, then use `access_graph_query` for targeted lookups before any mutation; after the edit, rebuild and check `broken`. The same guidance ships to every client as `access_tips('graph')`.
 
 ### Gotchas
 

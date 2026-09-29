@@ -16,7 +16,9 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from mcp_access.graph import GraphBuilder, _extract_record_source  # noqa: E402
+from mcp_access.graph import (  # noqa: E402
+    GraphBuilder, _extract_record_source, _strip_vba_comments,
+)
 from mcp_access.graph_query import ac_graph_query  # noqa: E402
 
 
@@ -207,3 +209,155 @@ def test_viewer_embed_cannot_close_the_script_tag(tmp_path):
     assert "alert(1)" in embedded  # payload stayed inside the data
     data = json.loads(embedded[len("var EMBEDDED_GRAPH = "):].rstrip().rstrip(";"))
     assert data["nodes"][0]["meta"]["sqlPreview"].startswith('SELECT "</script>')
+
+
+# ---------------------------------------------------------------------------
+# VBA comment stripping
+# ---------------------------------------------------------------------------
+
+def test_strip_vba_comments():
+    code = (
+        "DoCmd.OpenForm \"frmA\" ' open A\n"
+        "' DoCmd.OpenForm \"frmOld\"\n"
+        "Rem DoCmd.OpenForm \"frmRem\"\n"
+        "MsgBox \"it's \"\"quoted\"\" here\" ' tail\n"
+        "Remark = 1"
+    )
+    out = _strip_vba_comments(code).split("\n")
+    assert len(out) == 5
+    assert out[0].rstrip() == 'DoCmd.OpenForm "frmA"'
+    assert out[1] == "" and out[2] == ""
+    assert out[3].rstrip() == 'MsgBox "it\'s ""quoted"" here"'
+    assert out[4] == "Remark = 1"
+
+
+# ---------------------------------------------------------------------------
+# missing references
+# ---------------------------------------------------------------------------
+
+def _builder_with(*ids: str) -> GraphBuilder:
+    gb = GraphBuilder()
+    for nid in ids:
+        group, name = nid.split(":", 1)
+        gb.add_node(nid, name, group, is_data=group in ("table", "query"))
+    return gb
+
+
+def _missing(gb: GraphBuilder) -> list[dict]:
+    return [w for w in gb.warnings if w["code"] == "MissingReference"]
+
+
+def test_vba_reference_to_missing_form_is_warned_and_existing_is_linked():
+    gb = _builder_with("module:modNav", "form:frmA")
+    code = 'DoCmd.OpenForm "frmA"\nDoCmd.OpenForm "frmGone"\nDoCmd.OpenForm "frmGone"\n'
+    gb._analyze_code_heuristics("module:modNav", "module", "modNav", code, None)
+    assert [(e["to"], e["kind"]) for e in gb.edges] == [("form:frmA", "vba-openform")]
+    missing = _missing(gb)
+    assert len(missing) == 1  # deduplicated
+    assert missing[0]["meta"]["target"] == "frmGone"
+    assert missing[0]["meta"]["targetGroup"] == "form"
+    assert missing[0]["meta"]["ownerId"] == "module:modNav"
+
+
+def test_commented_out_code_creates_no_edge_or_warning():
+    gb = _builder_with("module:m", "form:frmA")
+    code = "' DoCmd.OpenForm \"frmA\"\nRem DoCmd.OpenForm \"frmGone\"\n"
+    gb._analyze_code_heuristics("module:m", "module", "m", code, None)
+    assert gb.edges == [] and _missing(gb) == []
+
+
+def test_runmacro_submacro_resolves_to_macro_group():
+    gb = _builder_with("module:m", "macro:mcrMenu")
+    gb._analyze_code_heuristics(
+        "module:m", "module", "m", 'DoCmd.RunMacro "mcrMenu.OpenOrders"\n', None)
+    assert [e["to"] for e in gb.edges] == ["macro:mcrMenu"]
+    assert _missing(gb) == []
+
+
+def test_source_object_missing_is_warned_and_table_prefix_resolves():
+    gb = _builder_with("form:frmMain", "table:tblLog")
+    gb._handle_source_object("form:frmMain", "Table.tblLog", "sfLog", "SubForm", {})
+    gb._handle_source_object("form:frmMain", "Form.sfGone", "sfX", "SubForm", {})
+    assert [e["to"] for e in gb.edges] == ["table:tblLog"]
+    missing = _missing(gb)
+    assert len(missing) == 1
+    assert missing[0]["meta"]["target"] == "Form.sfGone"
+    assert "sfX" in missing[0]["meta"]["via"]
+
+
+def test_expression_targets_are_not_reported_missing():
+    gb = _builder_with("macro:m")
+    gb._warn_missing("macro:m", "form", "=[Forms]![x]", "macro OpenForm")
+    assert _missing(gb) == []
+
+
+def test_build_output_records_mtime_and_warning_counts(tmp_path):
+    db = tmp_path / "x.accdb"
+    db.write_bytes(b"")
+    gb = _builder_with("module:m")
+    gb._warn_missing("module:m", "form", "frmGone", "VBA OpenForm")
+    r = gb.build_output(str(db), str(tmp_path / "out"), "referenced",
+                        embed_viewer=False)
+    assert r["warnings_by_code"] == {"MissingReference": 1}
+    meta = json.load(open(r["graph_path"], encoding="utf-8"))["meta"]
+    assert meta["databaseMtime"] == pytest.approx(os.path.getmtime(db))
+
+
+# ---------------------------------------------------------------------------
+# broken action / freshness
+# ---------------------------------------------------------------------------
+
+def _graph_with_warnings(tmp_path, db_mtime=None, db=None) -> str:
+    gb = _builder_with("module:modNav", "form:frmMain")
+    gb._warn_missing("module:modNav", "form", "frmOld", "VBA OpenForm")
+    gb._warn_missing("form:frmMain", "form", "frmOld", "SourceObject of sf")
+    gb.add_warning("ExportFailed", "boom", {"owner": "rptX", "group": "report"})
+    path = os.path.join(str(tmp_path), "graph.json")
+    meta = {"warnings": gb.warnings, "generatedAt": "2026-09-29T00:00:00+00:00"}
+    if db is not None:
+        meta["database"] = db
+    if db_mtime is not None:
+        meta["databaseMtime"] = db_mtime
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"meta": meta, "nodes": list(gb.nodes.values()),
+                   "edges": []}, f)
+    return path
+
+
+def test_broken_lists_all_warnings(tmp_path):
+    r = ac_graph_query("broken", graph_path=_graph_with_warnings(tmp_path))
+    assert r["count"] == 3
+    assert r["by_code"] == {"MissingReference": 2, "ExportFailed": 1}
+
+
+def test_broken_filters_by_deleted_target_name(tmp_path):
+    r = ac_graph_query("broken", graph_path=_graph_with_warnings(tmp_path),
+                       node="FRMOLD")
+    assert r["count"] == 2
+    assert {w["meta"]["owner"] for w in r["warnings"]} == {"modNav", "frmMain"}
+
+
+def test_broken_filters_by_owner(tmp_path):
+    r = ac_graph_query("broken", graph_path=_graph_with_warnings(tmp_path),
+                       node="rptX")
+    assert [w["code"] for w in r["warnings"]] == ["ExportFailed"]
+
+
+def test_freshness_fresh_and_stale(tmp_path):
+    db = tmp_path / "x.accdb"
+    db.write_bytes(b"")
+    built = os.path.getmtime(db)
+    path = _graph_with_warnings(tmp_path, db_mtime=built, db=str(db))
+    r = ac_graph_query("summary", graph_path=path)
+    assert r["graph"]["stale"] is False
+    assert r["graph"]["generatedAt"] == "2026-09-29T00:00:00+00:00"
+
+    os.utime(db, (built + 60, built + 60))
+    r = ac_graph_query("summary", graph_path=path)
+    assert r["graph"]["stale"] is True
+    assert "access_graph" in r["graph"]["note"]
+
+
+def test_freshness_unknown_for_old_graphs(sample):
+    r = ac_graph_query("summary", graph_path=sample)
+    assert r["graph"]["stale"] is None

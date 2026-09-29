@@ -37,9 +37,37 @@ graph is to an agent about to edit a database. No new tools (still **71**).
 
 ### Added
 
-- `tests/test_graph.py` — 16 pure tests, no COM. 11 of them fail on 0.7.64.
+- **`broken` action on `access_graph_query`** — lists build warnings, now
+  including **`MissingReference`**: a literal name in VBA (`DoCmd.Open*`,
+  `RunMacro`, `QueryDefs("x")`, `.SourceObject =`), a control's SourceObject or
+  a macro action that points at an object not in the database. These used to
+  be dropped silently — exactly the breakage an agent needs to see after a
+  rename or delete. `node` filters by owner *or* target name as plain text, so
+  `broken(node="frmOld")` still works once `frmOld` is gone. `access_graph`
+  also returns `warnings_by_code`. The viewer's Broken Objects report picks the
+  new warnings up unchanged.
+- **Staleness on every query result** — `graph: {generatedAt, stale}`. The
+  build records the `.accdb` mtime (`meta.databaseMtime`); `stale` is true once
+  the file has changed since. Server-side file times on both sides, so clock
+  skew on a network share can't fake it. Any write trips it, data included,
+  so it errs toward rebuilding.
+- **`access_tips('graph')`** — the edit workflow (impact → edit → rebuild →
+  broken), edge direction, node id format, staleness, and an explicit list of
+  what the graph cannot see, so an empty `impact` is not read as proof of
+  safety. Previously this guidance lived only in CLAUDE.md, which other MCP
+  clients never read.
+- `tests/test_graph.py` — 28 pure tests, no COM.
 - The `access_graph_query` description now says to run `impact` before a
-  rename/delete and that the graph must be regenerated after edits.
+  rename/delete and to check `graph.stale`.
+
+### Changed
+
+- **VBA comments are stripped before every code heuristic**, so commented-out
+  `DoCmd.OpenForm` lines, calls and string literals no longer create edges (or
+  the new missing-reference warnings).
+- Control `SourceObject` values of the form `Table.x` / `Query.x` now resolve
+  to the table/query; `RunMacro "mcrGroup.Sub"` resolves to `mcrGroup`.
+- `UnresolvedRecordSource` warnings carry `ownerId`.
 
 ## 0.7.64
 

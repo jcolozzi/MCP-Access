@@ -352,6 +352,36 @@ _TIPS: dict[str, str] = {
         "  after import — they open Design view which recalculates positions.\n"
         "  All changes must go in the text file BEFORE import."
     ),
+    "graph": (
+        "Dependency graph — use it to scope an edit before making it.\n\n"
+        "Workflow for a rename / delete / signature change:\n"
+        "  1. access_graph(db_path) once (slow: exports every form/report).\n"
+        "  2. access_graph_query(action='impact', node='Customers') — every\n"
+        "     object that uses it, with depth (1 = direct). Edge meta names the\n"
+        "     control (controlName), procedure, or relationship fields to touch.\n"
+        "  3. Make the edit.\n"
+        "  4. Re-run access_graph, then access_graph_query(action='broken') —\n"
+        "     MissingReference lists literal references to objects that no\n"
+        "     longer exist. broken(node='frmOld') works after frmOld is deleted.\n\n"
+        "Direction: edges point consumer -> dependency (form -> query -> table).\n"
+        "  impact = who uses X. neighbors(direction='out') = what X uses.\n"
+        "  Node ids are group:name (table:, query:, form:, report:, macro:,\n"
+        "  module:, sql:, field:<ownerGroup>:<owner>:<field>). A bare name used\n"
+        "  by two groups is ambiguous — pass the full id.\n\n"
+        "Staleness: the graph never refreshes itself. Every query result has\n"
+        "  graph.stale; true means the .accdb changed after the build (any design\n"
+        "  OR data write, so it can be a false alarm — but never trust a stale\n"
+        "  graph for a destructive edit).\n\n"
+        "What the graph does NOT see (so an empty impact is not proof of safety):\n"
+        "  - names built at runtime (DoCmd.OpenForm strName, Eval, string concat)\n"
+        "  - event-property expressions (OnClick =\"=MyFunc()\") and embedded macros\n"
+        "  - Sub calls without parentheses (MySub a, b); only Foo( and Call Foo\n"
+        "  - field-level lineage through queries, and Forms!frm!ctl in query SQL\n"
+        "  - objects in referenced library databases, ribbon XML, AutoExec\n"
+        "  Cross-check a rename with access_find_usages / access_search_controls.\n\n"
+        "orphans = no incoming edges: candidates to investigate, not dead code\n"
+        "  (startup form, AutoExec and ribbon-invoked objects always appear)."
+    ),
 }
 
 

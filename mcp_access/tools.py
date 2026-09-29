@@ -1449,7 +1449,7 @@ TOOLS = [
     # -- Tips / knowledge base -----------------------------------------------
     types.Tool(
         name="access_tips",
-        description="Tips and gotchas for working with Access via MCP. Topics: eval, controls, gotchas, sql, vbe, compile, design_vbe, macros, lint, layout, design, subform_tabcontrol. Without topic returns the list.",
+        description="Tips and gotchas for working with Access via MCP. Topics: eval, controls, gotchas, sql, vbe, compile, design_vbe, macros, lint, layout, design, subform_tabcontrol, graph. Without topic returns the list.",
         inputSchema={
             "type": "object",
             "properties": {
@@ -1708,16 +1708,17 @@ TOOLS = [
             "with depth; run it BEFORE renaming, deleting or changing a table, "
             "query, field, form or module), path (shortest path "
             "between two nodes), orphans (nodes with no incoming edges), "
-            "summary (stats + top-degree nodes). Loads graph.json from "
-            "access_graph output; re-run access_graph after edits, it does not "
-            "refresh itself."
+            "summary (stats + top-degree nodes), broken (references to objects "
+            "that do not exist + other build warnings; pass node to filter by "
+            "owner or target name). Every result has graph.stale — when true, "
+            "re-run access_graph before relying on it. See access_tips('graph')."
         ),
         inputSchema={
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["neighbors", "impact", "path", "orphans", "summary"],
+                    "enum": ["neighbors", "impact", "path", "orphans", "summary", "broken"],
                     "description": "Query action to perform",
                 },
                 "graph_path": {
@@ -1730,7 +1731,7 @@ TOOLS = [
                 },
                 "node": {
                     "type": "string",
-                    "description": "Node name or id for neighbors/impact (e.g. 'Customers' or 'table:Customers')",
+                    "description": "Node name or id for neighbors/impact (e.g. 'Customers' or 'table:Customers'). For broken: optional owner/target name filter (works for deleted objects)",
                 },
                 "source": {
                     "type": "string",

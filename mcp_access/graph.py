@@ -160,6 +160,7 @@ class GraphBuilder:
         self._sql_cache: dict[str, str] = {}
 
         self.warnings: list[dict] = []
+        self._missing_seen: set[tuple] = set()
         self.field_mode = field_mode
 
         # Raw SaveAsText export mode: "none" (compute rawHash/rawSize only)
@@ -244,6 +245,28 @@ class GraphBuilder:
             "meta": dict(meta) if meta else {},
         })
 
+    def _warn_missing(
+        self, owner_id: str, target_group: str, target: str, via: str
+    ) -> None:
+        """Record a literal reference to an object that is not in the database."""
+        # Macro arguments may be expressions resolved at runtime.
+        if target.startswith("="):
+            return
+        key = (owner_id, target_group, target.lower(), via)
+        if key in self._missing_seen:
+            return
+        self._missing_seen.add(key)
+        owner = self.nodes.get(owner_id, {})
+        owner_group = owner.get("group", "")
+        owner_name = owner.get("label", owner_id)
+        self.add_warning(
+            "MissingReference",
+            f"{owner_group} '{owner_name}' references {target_group} "
+            f"'{target}' ({via}), which does not exist in this database.",
+            {"owner": owner_name, "group": owner_group, "ownerId": owner_id,
+             "targetGroup": target_group, "target": target, "via": via},
+        )
+
     def _set_raw_meta(
         self, node_id: str, text: str, group: str, name: str
     ) -> None:
@@ -293,6 +316,18 @@ class GraphBuilder:
 
     def _node_exists(self, node_id: str) -> bool:
         return node_id in self.nodes
+
+    def _resolve_named(self, group: str, name: str) -> str | None:
+        """Node id for a literal object name, or None if it does not exist."""
+        node_id = self._object_id(group, name)
+        if self._node_exists(node_id):
+            return node_id
+        # RunMacro "mcrGroup.SubMacro" names a submacro inside mcrGroup.
+        if group == "macro" and "." in name:
+            node_id = self._object_id(group, name.split(".", 1)[0])
+            if self._node_exists(node_id):
+                return node_id
+        return None
 
     def _object_id(self, group: str, name: str) -> str:
         return f"{group}:{name}"
@@ -668,7 +703,7 @@ class GraphBuilder:
             "UnresolvedRecordSource",
             f"Could not resolve RecordSource '{record_source}' on "
             f"{owner_group} '{owner_name}'.",
-            {"owner": owner_name, "group": owner_group,
+            {"owner": owner_name, "group": owner_group, "ownerId": owner_id,
              "recordSource": record_source},
         )
         return None
@@ -692,6 +727,9 @@ class GraphBuilder:
                 meta["linkChildFields"] = lcf
             self.add_edge(owner_id, target_id, "SourceObject",
                           "sourceobject", "to", meta)
+        else:
+            self._warn_missing(owner_id, _source_object_group(source_object),
+                               source_object, f"SourceObject of {ctrl_name}")
 
     def _handle_row_source(
         self, owner_id: str, row_source: str,
@@ -767,6 +805,7 @@ class GraphBuilder:
     ) -> None:
         if not code:
             return
+        code = _strip_vba_comments(code)
 
         # DoCmd / QueryDefs patterns
         for pat in _VBA_PATTERNS:
@@ -774,10 +813,13 @@ class GraphBuilder:
                 ref_name = m.group(1).replace('""', '"')
                 if not ref_name:
                     continue
-                target_id = self._object_id(pat["group"], ref_name)
-                if self._node_exists(target_id):
+                target_id = self._resolve_named(pat["group"], ref_name)
+                if target_id:
                     self.add_edge(owner_id, target_id, pat["label"],
                                   pat["kind"], "to", {"name": ref_name})
+                else:
+                    self._warn_missing(owner_id, pat["group"], ref_name,
+                                       f"VBA {pat['label']}")
 
         # DoCmd.RunSQL
         for m in _VBA_RUNSQL_RE.finditer(code):
@@ -802,6 +844,9 @@ class GraphBuilder:
                 self.add_edge(owner_id, target_id, "SourceObject",
                               "vba-sourceobject", "to",
                               {"sourceObject": so_value})
+            else:
+                self._warn_missing(owner_id, _source_object_group(so_value),
+                                   so_value, "VBA SourceObject")
 
         # Type dependencies (As ClassName, New ClassName, ClassName.)
         seen_type: set[str] = set()
@@ -923,10 +968,13 @@ class GraphBuilder:
 
             if action in _MACRO_ACTIONS and arg_value:
                 grp, lbl, knd = _MACRO_ACTIONS[action]
-                target_id = self._object_id(grp, arg_value)
-                if self._node_exists(target_id):
+                target_id = self._resolve_named(grp, arg_value)
+                if target_id:
                     self.add_edge(macro_id, target_id, lbl, knd, "to",
                                   {"name": arg_value})
+                else:
+                    self._warn_missing(macro_id, grp, arg_value,
+                                       f"macro {lbl}")
 
             if action == "RunSQL" and arg_value:
                 sql_id = self._ensure_sql_node(
@@ -995,6 +1043,8 @@ class GraphBuilder:
             "meta": {
                 "database": db_path,
                 "generatedAt": datetime.now(timezone.utc).isoformat(),
+                # Server-side file time, so the staleness check survives clock skew.
+                "databaseMtime": _file_mtime(db_path),
                 "fieldNodeMode": {
                     "none": "None",
                     "referenced": "ReferencedOnly",
@@ -1021,7 +1071,14 @@ class GraphBuilder:
             "viewer_path": viewer_path,
             "stats": stats,
             "warning_count": len(self.warnings),
+            "warnings_by_code": self._warnings_by_code(),
         }
+
+    def _warnings_by_code(self) -> dict[str, int]:
+        counts: dict[str, int] = defaultdict(int)
+        for w in self.warnings:
+            counts[w["code"]] += 1
+        return dict(counts)
 
     def _compute_stats(self) -> dict:
         groups: dict[str, int] = {}
@@ -1069,6 +1126,35 @@ class GraphBuilder:
 
 def _is_system(name: str) -> bool:
     return name.startswith("MSys") or name.startswith("~")
+
+
+def _file_mtime(path: str) -> float | None:
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return None
+
+
+_REM_RE = re.compile(r"^\s*Rem(\s|$)", re.I)
+
+
+def _strip_vba_comments(code: str) -> str:
+    """Blank out VBA comments, keeping line count and string literals intact."""
+    out: list[str] = []
+    for line in code.splitlines():
+        if _REM_RE.match(line):
+            out.append("")
+            continue
+        in_str = False
+        cut = len(line)
+        for i, ch in enumerate(line):
+            if ch == '"':
+                in_str = not in_str  # "" inside a literal toggles twice
+            elif ch == "'" and not in_str:
+                cut = i
+                break
+        out.append(line[:cut])
+    return "\n".join(out)
 
 
 def _strip_brackets(name: str) -> str:
@@ -1165,12 +1251,20 @@ def _field_from_control_source(cs: str) -> str | None:
     return candidate if candidate else None
 
 
+_SOURCE_OBJECT_PREFIX_RE = re.compile(r"^(Form|Report|Table|Query)\.(.+)$", re.I)
+
+
+def _source_object_group(source_object: str) -> str:
+    m = _SOURCE_OBJECT_PREFIX_RE.match(source_object.strip())
+    return m.group(1).lower() if m else "form"
+
+
 def _resolve_source_object_target(
     source_object: str, builder: GraphBuilder
 ) -> str | None:
-    """Resolve 'Form.frmName', 'Report.rptName', or bare 'frmName'."""
+    """Resolve 'Form.x', 'Report.x', 'Table.x', 'Query.x', or a bare form/report name."""
     so = source_object.strip()
-    m = re.match(r"^(Form|Report)\.(.+)$", so, re.I)
+    m = _SOURCE_OBJECT_PREFIX_RE.match(so)
     if m:
         grp = m.group(1).lower()
         name = m.group(2)

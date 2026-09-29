@@ -7,6 +7,7 @@ Loads a previously-generated graph.json and supports targeted queries:
   path       — shortest path between two nodes
   orphans    — nodes with zero incoming edges
   summary    — high-level stats, top edge kinds, high-degree nodes
+  broken     — references to missing objects and other build warnings
 """
 
 from __future__ import annotations
@@ -401,6 +402,60 @@ def _action_summary(g: _Graph, group: str | None) -> dict:
     }
 
 
+def _action_broken(g: _Graph, name: str | None) -> dict:
+    """Build warnings, optionally only those naming ``name`` as owner or target.
+
+    Matched as plain text, not resolved, so a deleted object can still be asked
+    about by the name its callers use.
+    """
+    warnings: list[dict] = g.meta.get("warnings", [])
+    if name:
+        low = name.strip().lower()
+        warnings = [
+            w for w in warnings
+            if low in (str(w.get("meta", {}).get("owner", "")).lower(),
+                       str(w.get("meta", {}).get("ownerId", "")).lower(),
+                       str(w.get("meta", {}).get("target", "")).lower())
+        ]
+    by_code: dict[str, int] = defaultdict(int)
+    for w in warnings:
+        by_code[w.get("code", "")] += 1
+    return {
+        "action": "broken",
+        "filter": name,
+        "count": len(warnings),
+        "by_code": dict(by_code),
+        "warnings": warnings[:_MAX_RESULTS],
+        "truncated": len(warnings) > _MAX_RESULTS,
+    }
+
+
+_MTIME_TOLERANCE_SEC = 2  # FAT/SMB timestamp granularity
+
+
+def _freshness(g: _Graph, db_path: str | None) -> dict:
+    """Whether the database file changed after the graph was built."""
+    out: dict[str, Any] = {"generatedAt": g.meta.get("generatedAt")}
+    built = g.meta.get("databaseMtime")
+    db = db_path or g.meta.get("database")
+    current = None
+    if db:
+        try:
+            current = os.path.getmtime(db)
+        except OSError:
+            pass
+    if built is None or current is None:
+        out["stale"] = None
+        return out
+    out["stale"] = current > built + _MTIME_TOLERANCE_SEC
+    if out["stale"]:
+        out["note"] = (
+            "The database file changed after this graph was built (design or "
+            "data). Re-run access_graph before relying on it for an edit."
+        )
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Entry point (called from dispatcher — no COM needed)
 # ---------------------------------------------------------------------------
@@ -425,6 +480,9 @@ def ac_graph_query(
         path      — shortest path between two nodes
         orphans   — nodes with zero incoming edges
         summary   — high-level stats and top-degree nodes
+        broken    — missing-object references and other build warnings
+
+    Every result carries ``graph`` with ``generatedAt`` and ``stale``.
     """
     g = _load_graph(graph_path, db_path)
 
@@ -448,25 +506,31 @@ def ac_graph_query(
 
     if action == "neighbors":
         nid = _must_resolve(node, "node")
-        return _action_neighbors(g, nid, depth, direction, skip_fields)
+        result = _action_neighbors(g, nid, depth, direction, skip_fields)
 
     elif action == "impact":
         nid = _must_resolve(node, "node")
-        return _action_impact(g, nid, skip_fields)
+        result = _action_impact(g, nid, skip_fields)
 
     elif action == "path":
         sid = _must_resolve(source, "source")
         tid = _must_resolve(target, "target")
-        return _action_path(g, sid, tid)
+        result = _action_path(g, sid, tid)
 
     elif action == "orphans":
-        return _action_orphans(g, skip_fields)
+        result = _action_orphans(g, skip_fields)
 
     elif action == "summary":
-        return _action_summary(g, group)
+        result = _action_summary(g, group)
+
+    elif action == "broken":
+        result = _action_broken(g, node)
 
     else:
         raise ValueError(
             f"Unknown action '{action}'. "
-            f"Valid actions: neighbors, impact, path, orphans, summary"
+            f"Valid actions: neighbors, impact, path, orphans, summary, broken"
         )
+
+    result["graph"] = _freshness(g, db_path)
+    return result
