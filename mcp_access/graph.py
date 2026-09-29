@@ -40,20 +40,71 @@ _RECORDSOURCE_RE = re.compile(r"^\s+RecordSource\s*=\s*(.*?)\s*$")
 # VBA DoCmd / QueryDefs patterns  (case-insensitive, dot-all)
 # Optional "(" and a leading named argument: DoCmd.OpenForm(FormName:="x")
 _DOCMD_ARG = r'\s*\(?\s*(?:\w+\s*:=\s*)?"((?:[^"]|"")+)"'
+# First argument as written: literal, variable or expression (classified later)
+_FIRST_ARG = r'\s*\(?\s*(?:\w+\s*:=\s*)?((?:"(?:[^"]|"")*"|[^,:\n"])+)'
 _VBA_PATTERNS: list[dict[str, str]] = [
-    {"regex": r'\bDoCmd\.OpenForm' + _DOCMD_ARG,
+    {"regex": r'\bDoCmd\.OpenForm' + _FIRST_ARG,
      "group": "form",  "label": "OpenForm",  "kind": "vba-openform"},
-    {"regex": r'\bDoCmd\.OpenReport' + _DOCMD_ARG,
+    {"regex": r'\bDoCmd\.OpenReport' + _FIRST_ARG,
      "group": "report", "label": "OpenReport", "kind": "vba-openreport"},
-    {"regex": r'\bDoCmd\.OpenQuery' + _DOCMD_ARG,
+    {"regex": r'\bDoCmd\.OpenQuery' + _FIRST_ARG,
      "group": "query",  "label": "OpenQuery",  "kind": "vba-openquery"},
-    {"regex": r'\bDoCmd\.OpenTable' + _DOCMD_ARG,
+    {"regex": r'\bDoCmd\.OpenTable' + _FIRST_ARG,
      "group": "table",  "label": "OpenTable",  "kind": "vba-opentable"},
-    {"regex": r'\.\s*QueryDefs\s*\(\s*"((?:[^"]|"")+)"\s*\)',
+    {"regex": r'\.\s*QueryDefs\s*\(((?:"(?:[^"]|"")*"|[^,:\n"])+)',
      "group": "query",  "label": "QueryDefs", "kind": "vba-querydefs"},
-    {"regex": r'\bDoCmd\.RunMacro' + _DOCMD_ARG,
+    {"regex": r'\bDoCmd\.RunMacro' + _FIRST_ARG,
      "group": "macro",  "label": "RunMacro",  "kind": "vba-runmacro"},
 ]
+_VBA_EVAL_RE = re.compile(r'\bEval\s*\(\s*"((?:[^"]|"")+)"', re.I)
+_VBA_APP_RUN_RE = re.compile(r'\bApplication\s*\.\s*Run' + _FIRST_ARG, re.I)
+
+_IDENT_RE = re.compile(r"[A-Za-z_]\w*")
+_STRING_LITERAL_FULL_RE = re.compile(r'"((?:[^"]|"")*)"')
+
+# Procedure boundaries and string bindings (for names held in variables)
+_PROC_START_RE = re.compile(
+    r"^[ \t]*(?:(?:Public|Private|Friend|Static)[ \t]+)*"
+    r"(?:Sub|Function|Property[ \t]+(?:Get|Let|Set))[ \t]+\w+",
+    re.I | re.M,
+)
+_PROC_END_RE = re.compile(r"^[ \t]*End[ \t]+(?:Sub|Function|Property)\b.*$", re.I | re.M)
+_CONST_RE = re.compile(
+    r'^[ \t]*(?:(Public|Global|Private|Dim)[ \t]+)?Const[ \t]+(\w+)'
+    r'(?:[ \t]+As[ \t]+String)?[ \t]*=[ \t]*"((?:[^"]|"")*)"[ \t]*$',
+    re.I | re.M,
+)
+_STR_ASSIGN_RE = re.compile(
+    r'^[ \t]*(?:Let[ \t]+)?(\w+)[ \t]*=[ \t]*"((?:[^"]|"")*)"[ \t]*$', re.I | re.M
+)
+
+# Recordsets: Set rs = ...OpenRecordset(arg) / Me.RecordsetClone; With blocks
+_SET_RE = re.compile(r"^[ \t]*Set[ \t]+(\w+)[ \t]*=[ \t]*(.+?)[ \t]*$", re.I | re.M)
+_OPEN_RS_ARG_RE = re.compile(
+    r'\.\s*OpenRecordset\s*\(\s*((?:"(?:[^"]|"")*"|[^,)\n"])+)', re.I
+)
+_ME_RECORDSET_RE = re.compile(r"^Me(?:\s*\.\s*Form)?\s*\.\s*Recordset(?:Clone)?$", re.I)
+_WITH_BLOCK_RE = re.compile(
+    r"^[ \t]*With[ \t]+(.+?)[ \t]*$(.*?)^[ \t]*End[ \t]+With\b", re.I | re.M | re.S
+)
+_WITH_FIELD_RE = re.compile(
+    r'(?:^|(?<=[\s(=,&+\-*/<>]))(?:!(?:\[([^\]]+)\]|(\w+))'
+    r'|\.\s*Fields\s*\(\s*"((?:[^"]|"")+)"\s*\))',
+    re.M,
+)
+# Me!Field / Me("Field") / Me.Field in form or report code
+_ME_FIELD_RE = re.compile(
+    r'\bMe\s*(?:!\s*(?:\[([^\]]+)\]|(\w+))|\(\s*"((?:[^"]|"")+)"\s*\)'
+    r'|\.\s*(\w+)\b(?!\s*\())',
+    re.I,
+)
+
+# Bare identifier in SQL: not qualified, not a qualifier, not a function call
+_SQL_TOKEN_RE = re.compile(
+    r"(?<![.!\w\]])(?:\[([^\]]+)\]|([A-Za-z_]\w*))(?!\w|\s*[.!(])"
+)
+
+_ACCESS_LIBRARY_EXTS = {".accda", ".accdb", ".accde", ".mda", ".mdb", ".mde"}
 
 _VBA_RUNSQL_RE = re.compile(
     r'\bDoCmd\.RunSQL' + _DOCMD_ARG, re.I | re.S
@@ -211,6 +262,13 @@ class GraphBuilder:
 
         self.warnings: list[dict] = []
         self._missing_seen: set[tuple] = set()
+        # References whose target name is computed at runtime (see _record_dynamic)
+        self.dynamic_refs: list[dict] = []
+        self._dynamic_seen: set[tuple] = set()
+        # Public string constants across standard modules: name -> values
+        self._global_consts: dict[str, set[str]] = defaultdict(set)
+        # (group, name lower) -> library node id, for objects in referenced libraries
+        self._library_objects: dict[tuple[str, str], str] = {}
         # node id -> design timestamp at build time (see design_stamps)
         self.design_stamps: dict[str, str] = {}
         self.field_mode = field_mode
@@ -379,7 +437,7 @@ class GraphBuilder:
             node_id = self._object_id(group, name.split(".", 1)[0])
             if self._node_exists(node_id):
                 return node_id
-        return None
+        return self._library_objects.get((group, name.lower()))
 
     def _object_id(self, group: str, name: str) -> str:
         return f"{group}:{name}"
@@ -448,15 +506,215 @@ class GraphBuilder:
                 )
 
     def _add_field_ref_edges(self, from_id: str, sql: str, kind: str) -> None:
-        """Edges to the table fields a SQL statement names as Table.Field."""
-        for table, field in _qualified_field_refs(sql, self._known_table_fields):
+        """Edges to the fields a SQL statement uses, qualified or not.
+
+        Sources are the tables/queries the statement names whose fields are
+        known. An unqualified name is attributed only when exactly one of
+        them defines it.
+        """
+        sources: dict[str, dict[str, str]] = {}
+        groups: dict[str, str] = {}
+        for name in _find_referenced_data_names(sql, self._known_data_names):
+            for t in self._targets_for_name(name, data_only=True):
+                if t["node_id"] == from_id:
+                    continue
+                fields = self._fields_of(t["group"], t["name"])
+                if fields:
+                    sources[t["name"]] = fields
+                    groups[t["name"]] = t["group"]
+                break
+        pairs = _qualified_field_refs(sql, sources)
+        pairs += [p for p in _bare_field_refs(sql, sources) if p not in pairs]
+        for source, field in pairs:
+            group = groups[source]
             fid = self._ensure_field_node(
-                self._object_id("table", table), "table", table, field,
-                True, self._known_table_fields[table][field],
+                self._object_id(group, source), group, source, field,
+                True, sources[source][field],
             )
             if fid:
                 self.add_edge(from_id, fid, field, kind, "to",
-                              {"field": f"{table}.{field}"})
+                              {"field": f"{source}.{field}"})
+
+    def _handle_named_arg(
+        self, owner_id: str, pat: dict, raw_arg: str, scope: _VbaScope, pos: int,
+    ) -> None:
+        """Resolve the object-name argument of a DoCmd/QueryDefs call."""
+        kind, value = _classify_arg(_clean_arg(raw_arg))
+        via = None
+        if kind == "literal":
+            values = [value]
+        elif kind == "variable" and value.lower() in scope.bindings_at(pos):
+            values = sorted(scope.bindings_at(pos)[value.lower()])
+            via = value
+        else:
+            if value:
+                self._record_dynamic(owner_id, pat["group"], pat["label"], value)
+            return
+        for name in values:
+            if not name:
+                continue
+            target_id = self._resolve_named(pat["group"], name)
+            meta = {"name": name, **({"via": via} if via else {})}
+            if target_id:
+                self.add_edge(owner_id, target_id, pat["label"], pat["kind"],
+                              "to", meta)
+            else:
+                self._warn_missing(
+                    owner_id, pat["group"], name,
+                    f"VBA {pat['label']}" + (f" via {via}" if via else ""))
+
+    def _handle_app_run(
+        self, owner_id: str, raw_arg: str, scope: _VbaScope, pos: int,
+    ) -> None:
+        kind, value = _classify_arg(_clean_arg(raw_arg))
+        if kind == "variable" and value.lower() in scope.bindings_at(pos):
+            values = sorted(scope.bindings_at(pos)[value.lower()])
+        elif kind == "literal":
+            values = [value]
+        else:
+            if value:
+                self._record_dynamic(owner_id, "module", "Application.Run", value)
+            return
+        for full in values:
+            # "Proc", "Module.Proc" or "Library.Proc"
+            proc = full.rsplit(".", 1)[-1]
+            for tid in self._proc_index.get(proc.lower(), []):
+                if tid != owner_id:
+                    self.add_edge(owner_id, tid, f"calls {proc}", "vba-call",
+                                  "to", {"procedure": proc, "via": "Application.Run"})
+
+    def _record_dynamic(
+        self, owner_id: str, group: str, call: str, expr: str
+    ) -> None:
+        """Remember a reference whose target name is only known at runtime."""
+        key = (owner_id, group, call, expr)
+        if key in self._dynamic_seen:
+            return
+        self._dynamic_seen.add(key)
+        owner = self.nodes.get(owner_id, {})
+        self.dynamic_refs.append({
+            "ownerId": owner_id, "owner": owner.get("label", owner_id),
+            "group": group, "call": call, "expr": expr[:120],
+        })
+
+    # ── recordset / Me field references ─────────────────────────────────
+
+    def _source_for(self, target: dict | None) -> tuple[str, str, dict] | None:
+        """(group, name, fields) for a table/query/single-table-SQL target."""
+        if not target:
+            return None
+        group, name = target["group"], target["name"]
+        if group == "sql":
+            if not target.get("table"):
+                return None
+            group, name = "table", target["table"]
+        fields = self._fields_of(group, name)
+        return (group, name, fields) if fields else None
+
+    def _source_from_arg(
+        self, raw_arg: str, bindings: dict[str, set[str]]
+    ) -> tuple[str, str, dict] | None:
+        """Recordset source from an OpenRecordset argument (name or SQL)."""
+        kind, value = _classify_arg(_clean_arg(raw_arg))
+        if kind == "variable":
+            vals = bindings.get(value.lower(), set())
+            if len(vals) != 1:
+                return None
+            value = next(iter(vals))
+        elif kind != "literal":
+            return None
+        if _is_likely_sql(value):
+            names = _find_referenced_data_names(value, self._known_data_names)
+            if len(names) != 1:
+                return None
+            value = names[0]
+        for t in self._targets_for_name(value, data_only=True):
+            return self._source_for(t)
+        return None
+
+    def _recordset_source(
+        self, expr: str, bindings: dict[str, set[str]], me_source: dict | None,
+    ) -> tuple[str, str, dict] | None:
+        expr = expr.strip()
+        if _ME_RECORDSET_RE.match(expr):
+            return self._source_for(me_source)
+        m = _OPEN_RS_ARG_RE.search(expr)
+        return self._source_from_arg(m.group(1), bindings) if m else None
+
+    def _link_recordset_fields(
+        self, owner_id: str, code: str, scope: _VbaScope, me_source: dict | None,
+    ) -> None:
+        for start, end in scope.spans:
+            body = code[start:end]
+            bindings = scope.bindings_at(start)
+            rs_sources: dict[str, tuple | None] = {}
+            for m in _SET_RE.finditer(body):
+                var = m.group(1).lower()
+                src = self._recordset_source(m.group(2), bindings, me_source)
+                if var in rs_sources and rs_sources[var] != src:
+                    rs_sources[var] = None  # re-pointed: ambiguous, skip it
+                elif src is not None or var not in rs_sources:
+                    rs_sources[var] = src
+            for var, src in rs_sources.items():
+                if not src:
+                    continue
+                v = re.escape(var)
+                for m in re.finditer(
+                    rf'\b{v}\s*(?:!\s*(?:\[([^\]]+)\]|(\w+))'
+                    rf'|(?:\.\s*Fields)?\s*\(\s*"((?:[^"]|"")+)"\s*\))',
+                    body, re.I,
+                ):
+                    fname = m.group(1) or m.group(2) or m.group(3)
+                    self._link_vba_field(owner_id, src, fname, f"{var}!{fname}")
+            for m in _WITH_BLOCK_RE.finditer(body):
+                target = m.group(1).strip()
+                src = rs_sources.get(target.lower()) or self._recordset_source(
+                    target, bindings, me_source)
+                if not src:
+                    continue
+                for f in _WITH_FIELD_RE.finditer(m.group(2)):
+                    fname = f.group(1) or f.group(2) or f.group(3)
+                    self._link_vba_field(owner_id, src, fname,
+                                         f"With {target}: !{fname}")
+
+    def _link_vba_field(
+        self, owner_id: str, src: tuple, fname: str, via: str, *, warn: bool = True,
+    ) -> bool:
+        group, name, fields = src
+        hit = _lookup_field(fields, fname)
+        if not hit:
+            if warn:
+                owner = self.nodes.get(owner_id, {})
+                self.add_warning(
+                    "MissingField",
+                    f"{owner.get('group', '')} '{owner.get('label', owner_id)}' "
+                    f"reads '{fname}' ({via}), which is not a field of "
+                    f"{group} '{name}'.",
+                    {"owner": owner.get("label", owner_id),
+                     "group": owner.get("group", ""), "ownerId": owner_id,
+                     "targetGroup": group, "target": name, "field": fname,
+                     "via": via},
+                )
+            return False
+        fid = self._ensure_field_node(self._object_id(group, name), group, name,
+                                      hit[0], True, hit[1])
+        if fid:
+            self.add_edge(owner_id, fid, hit[0], "vba-field", "to", {"via": via})
+        return True
+
+    def _link_me_fields(
+        self, owner_id: str, code: str, me_source: dict, controls: frozenset,
+    ) -> None:
+        """Me!X / Me("X") / Me.X naming a RecordSource field that is not a control."""
+        src = self._source_for(me_source)
+        if not src:
+            return
+        for m in _ME_FIELD_RE.finditer(code):
+            fname = m.group(1) or m.group(2) or m.group(3) or m.group(4)
+            if fname.lower() in controls:
+                continue
+            # Me.X is usually a form property or method: link only real fields.
+            self._link_vba_field(owner_id, src, fname, f"Me!{fname}", warn=False)
 
     def _link_object_refs(
         self, owner_id: str, text: str, meta: dict | None = None,
@@ -735,8 +993,68 @@ class GraphBuilder:
 
             self._module_code_cache[mod_name] = code
             self.index_module_procs(node_id, code, is_class=is_class)
+            for k, v in _public_consts(code).items():
+                self._global_consts[k] |= v
 
         self._compile_proc_call_re()
+
+    def scan_vba_projects(self, app: Any) -> None:
+        """Index referenced library databases and report broken VBA references."""
+        from .core import _get_vb_project
+        try:
+            for ref in _get_vb_project(app).References:
+                try:
+                    broken = bool(ref.IsBroken)
+                except Exception:
+                    broken = True
+                if broken:
+                    name = _safe_attr(ref, "Name") or _safe_attr(ref, "Guid")
+                    path = _safe_attr(ref, "FullPath")
+                    self.add_warning(
+                        "BrokenReference",
+                        f"VBA reference '{name}' is broken ({path or 'path unknown'}); "
+                        "the project will not compile until it is fixed.",
+                        {"owner": name, "group": "reference", "target": path},
+                    )
+        except Exception:
+            pass
+
+        try:
+            host = str(app.CurrentProject.FullName)
+            projects = list(app.VBE.VBProjects)
+        except Exception:
+            return
+        for proj in projects:
+            path = _safe_attr(proj, "FileName")
+            if (not path or _same_file(path, host)
+                    or os.path.splitext(path)[1].lower() not in _ACCESS_LIBRARY_EXTS):
+                continue
+            self.add_library(
+                _safe_attr(proj, "Name") or os.path.basename(path), path,
+                _library_components(proj))
+
+    def add_library(self, name: str, path: str, components: dict | None) -> str:
+        """Register a library project: its forms/reports resolve, its procs are callable.
+
+        ``components`` is ``{"forms": [...], "reports": [...], "modules":
+        {name: code}}``, or None when the project is locked (e.g. an .accde).
+        """
+        lib_id = f"library:{name}"
+        comps = components or {"forms": [], "reports": [], "modules": {}}
+        self.add_node(lib_id, name, "library", meta={
+            "path": path, "locked": components is None,
+            "forms": comps["forms"], "reports": comps["reports"],
+            "modules": sorted(comps["modules"]),
+        })
+        for group, key in (("form", "forms"), ("report", "reports")):
+            for obj in comps[key]:
+                self._library_objects.setdefault((group, obj.lower()), lib_id)
+        for mod, code in comps["modules"].items():
+            self._library_objects.setdefault(("module", mod.lower()), lib_id)
+            self.index_module_procs(lib_id, code)
+            for k, v in _public_consts(code).items():
+                self._global_consts[k] |= v
+        return lib_id
 
     def index_module_procs(
         self, node_id: str, code: str, *, is_class: bool = False
@@ -836,8 +1154,11 @@ class GraphBuilder:
 
         # --- VBA code heuristics ---
         if include_code and vba_code:
+            controls = frozenset(
+                c.get("name", "").lower() for c in parsed.get("controls", []))
             self._analyze_code_heuristics(
-                object_id, group, name, vba_code, sql_dir
+                object_id, group, name, vba_code, sql_dir,
+                me_source=rs_target, me_controls=controls,
             )
 
         # --- Event properties, expressions, embedded macros ---
@@ -1034,24 +1355,30 @@ class GraphBuilder:
     def _analyze_code_heuristics(
         self, owner_id: str, owner_group: str, owner_name: str,
         code: str, sql_dir: str | None,
+        me_source: dict | None = None, me_controls: frozenset = frozenset(),
     ) -> None:
         if not code:
             return
         code = _strip_vba_comments(code)
+        scope = _VbaScope(code, self._global_consts)
 
-        # DoCmd / QueryDefs patterns
+        # DoCmd / QueryDefs: literal, variable/constant, or runtime expression
         for pat in _VBA_PATTERNS:
-            for m in re.finditer(pat["regex"], code, re.I | re.S):
-                ref_name = m.group(1).replace('""', '"')
-                if not ref_name:
-                    continue
-                target_id = self._resolve_named(pat["group"], ref_name)
-                if target_id:
-                    self.add_edge(owner_id, target_id, pat["label"],
-                                  pat["kind"], "to", {"name": ref_name})
-                else:
-                    self._warn_missing(owner_id, pat["group"], ref_name,
-                                       f"VBA {pat['label']}")
+            for m in re.finditer(pat["regex"], code, re.I):
+                self._handle_named_arg(owner_id, pat, m.group(1),
+                                       scope, m.start())
+
+        # Eval("Fn()") and Application.Run "Proc"
+        for m in _VBA_EVAL_RE.finditer(code):
+            self._link_function_calls(owner_id, m.group(1).replace('""', '"'),
+                                      "Eval", "vba-call", {"via": "Eval"})
+        for m in _VBA_APP_RUN_RE.finditer(code):
+            self._handle_app_run(owner_id, m.group(1), scope, m.start())
+
+        # Recordset and Me field references
+        self._link_recordset_fields(owner_id, code, scope, me_source)
+        if me_source:
+            self._link_me_fields(owner_id, code, me_source, me_controls)
 
         # DoCmd.RunSQL
         for m in _VBA_RUNSQL_RE.finditer(code):
@@ -1165,6 +1492,7 @@ class GraphBuilder:
     # ── Phase 5: query & macro edges ────────────────────────────────────
 
     def analyze_query_edges(self, app: Any, db: Any, sql_dir: str | None) -> None:
+        queries: list[tuple[str, str]] = []
         for qd in db.QueryDefs:
             name: str = qd.Name
             if _is_system(name):
@@ -1186,9 +1514,14 @@ class GraphBuilder:
                             node_id, t["node_id"], dname,
                             "query-sql-reference", "to", {"name": dname},
                         )
-            self._add_field_ref_edges(node_id, sql, "query-field")
             self._link_object_refs(node_id, sql, {"via": "SQL"})
             self._read_query_fields(qd, name, node_id)
+            queries.append((node_id, sql))
+
+        # Second pass: every query's output fields are known by now, so a
+        # query built on another query can attribute its field names.
+        for node_id, sql in queries:
+            self._add_field_ref_edges(node_id, sql, "query-field")
 
         if self.field_mode == "all":
             for qname, fields in self._known_query_fields.items():
@@ -1339,6 +1672,7 @@ class GraphBuilder:
                 "database": db_path,
                 "generatedAt": datetime.now(timezone.utc).isoformat(),
                 "designStamps": self.design_stamps,
+                "dynamicReferences": self.dynamic_refs,
                 "fieldNodeMode": {
                     "none": "None",
                     "referenced": "ReferencedOnly",
@@ -1390,6 +1724,8 @@ class GraphBuilder:
             "modules": groups.get("module", 0),
             "sqlNodes": groups.get("sql", 0),
             "fieldNodes": groups.get("field", 0),
+            "libraries": groups.get("library", 0),
+            "dynamicReferences": len(self.dynamic_refs),
             "warnings": len(self.warnings),
         }
 
@@ -1420,6 +1756,37 @@ class GraphBuilder:
 
 def _is_system(name: str) -> bool:
     return name.startswith("MSys") or name.startswith("~")
+
+
+def _same_file(a: str, b: str) -> bool:
+    """Path equality that survives 8.3 short names and mapped drive vs UNC."""
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+
+def _library_components(proj: Any) -> dict | None:
+    """Forms/reports with a code module and standard-module code of a VBProject.
+
+    None when the project cannot be read (locked or compiled-only).
+    """
+    out: dict[str, Any] = {"forms": [], "reports": [], "modules": {}}
+    try:
+        for comp in proj.VBComponents:
+            cname = str(comp.Name)
+            ctype = int(comp.Type)
+            if ctype == 100 and cname.startswith("Form_"):
+                out["forms"].append(cname[5:])
+            elif ctype == 100 and cname.startswith("Report_"):
+                out["reports"].append(cname[7:])
+            elif ctype == 1:  # vbext_ct_StdModule
+                cm = comp.CodeModule
+                n = int(cm.CountOfLines)
+                out["modules"][cname] = str(cm.Lines(1, n)) if n else ""
+    except Exception:
+        return None
+    return out
 
 
 def design_stamps(app: Any, db: Any) -> dict[str, str]:
@@ -1480,6 +1847,119 @@ def _blank_string_literals(code: str) -> str:
     return _VBA_STRING_LITERAL_RE.sub(
         lambda m: '"' + " " * len(m.group(1)) + '"', code
     )
+
+
+def _clean_arg(raw: str) -> str:
+    """Cut a captured argument at the first unbalanced ')' outside strings."""
+    depth = 0
+    in_str = False
+    for i, ch in enumerate(raw):
+        if ch == '"':
+            in_str = not in_str
+        elif not in_str:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth < 0:
+                    return raw[:i].strip()
+    return raw.strip()
+
+
+def _classify_arg(arg: str) -> tuple[str, str]:
+    """('literal', text) | ('variable', name) | ('expression', arg)."""
+    m = _STRING_LITERAL_FULL_RE.fullmatch(arg)
+    if m:
+        return "literal", m.group(1).replace('""', '"')
+    if _IDENT_RE.fullmatch(arg):
+        return "variable", arg
+    return "expression", arg
+
+
+def _proc_spans(code: str) -> list[tuple[int, int]]:
+    """Character spans of each procedure, from its header to its End line."""
+    spans: list[tuple[int, int]] = []
+    ends = [m.end() for m in _PROC_END_RE.finditer(code)]
+    for m in _PROC_START_RE.finditer(code):
+        end = next((e for e in ends if e > m.start()), len(code))
+        if not spans or m.start() >= spans[-1][1]:
+            spans.append((m.start(), end))
+    return spans
+
+
+def _string_bindings(text: str) -> dict[str, set[str]]:
+    """name (lower) -> string literals assigned to it by Const or plain assignment."""
+    out: dict[str, set[str]] = defaultdict(set)
+    for m in _CONST_RE.finditer(text):
+        out[m.group(2).lower()].add(m.group(3).replace('""', '"'))
+    for m in _STR_ASSIGN_RE.finditer(text):
+        out[m.group(1).lower()].add(m.group(2).replace('""', '"'))
+    return out
+
+
+def _public_consts(code: str) -> dict[str, set[str]]:
+    """Module-level Public/Global string constants of a standard module."""
+    spans = _proc_spans(code)
+    out: dict[str, set[str]] = defaultdict(set)
+    for m in _CONST_RE.finditer(code):
+        if (m.group(1) or "").lower() not in ("public", "global"):
+            continue
+        if any(s <= m.start() < e for s, e in spans):
+            continue
+        out[m.group(2).lower()].add(m.group(3).replace('""', '"'))
+    return out
+
+
+class _VbaScope:
+    """Resolves a variable to the string literals it can hold at a position.
+
+    Scope is approximate on purpose: procedure-local bindings, then the
+    module's own (module-level) bindings, then public constants of every
+    standard module. Parameters and computed values stay unresolved.
+    """
+
+    def __init__(self, code: str, global_consts: dict[str, set[str]]):
+        self.spans = _proc_spans(code)
+        outside = code
+        for s, e in reversed(self.spans):
+            outside = outside[:s] + "\n" * code.count("\n", s, e) + outside[e:]
+        self._module = _string_bindings(outside)
+        self._procs = [_string_bindings(code[s:e]) for s, e in self.spans]
+        self._global = global_consts
+
+    def bindings_at(self, pos: int) -> dict[str, set[str]]:
+        merged: dict[str, set[str]] = defaultdict(set)
+        for src in (self._global, self._module):
+            for k, v in src.items():
+                merged[k] |= v
+        for (s, e), proc in zip(self.spans, self._procs):
+            if s <= pos < e:
+                for k, v in proc.items():
+                    merged[k] = set(v)  # a local binding shadows outer ones
+                break
+        return merged
+
+
+def _bare_field_refs(
+    sql: str, sources: dict[str, dict[str, str]]
+) -> list[tuple[str, str]]:
+    """(source, field) for unqualified names that exactly one source defines."""
+    text = _SQL_STRING_RE.sub("''", sql)
+    owners: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    for src, fields in sources.items():
+        for f in fields:
+            owners[f.lower()].append((src, f))
+    source_names = {s.lower() for s in sources}
+    out: list[tuple[str, str]] = []
+    for m in _SQL_TOKEN_RE.finditer(text):
+        tok = m.group(1) or m.group(2)
+        low = tok.lower()
+        if (m.group(2) and tok.upper() in _SQL_KEYWORDS) or low in source_names:
+            continue
+        hits = owners.get(low, [])
+        if len(hits) == 1 and hits[0] not in out:
+            out.append(hits[0])
+    return out
 
 
 def _lookup_field(fields: dict[str, str], name: str) -> tuple[str, str] | None:
@@ -1760,6 +2240,7 @@ def ac_graph(
     gb.finalize_data_names()
 
     # Build cross-module procedure index (must precede code heuristics)
+    gb.scan_vba_projects(app)
     if include_code_heuristics:
         gb.build_proc_index(db_path)
 

@@ -64,7 +64,7 @@ class _Graph:
 
         # 2. Try group:name for all groups — a form and a table may share a name
         _GROUPS = ("table", "query", "form", "report", "macro",
-                   "module", "field", "sql")
+                   "module", "library", "field", "sql")
         group_hits = [
             self._id_lookup[f"{g}:{name}".lower()]
             for g in _GROUPS
@@ -137,6 +137,7 @@ def _fmt_edge(e: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 _MAX_RESULTS = 200
+_MAX_DYNAMIC = 20
 
 
 def _action_neighbors(
@@ -240,7 +241,7 @@ def _action_impact(g: _Graph, node_id: str, skip_fields: bool) -> dict:
     for a in affected:
         by_group[a["group"]].append(a["label"])
 
-    return {
+    result = {
         "action": "impact",
         "node": _fmt_node(g.nodes[node_id]),
         "affected_count": len(affected),
@@ -249,6 +250,18 @@ def _action_impact(g: _Graph, node_id: str, skip_fields: bool) -> dict:
         "edges": edges_used[:_MAX_RESULTS],
         "truncated": truncated,
     }
+    group = g.nodes[node_id]["group"]
+    dynamic = [d for d in g.meta.get("dynamicReferences", [])
+               if d.get("group") == group]
+    if dynamic:
+        result["dynamic_references"] = {
+            "count": len(dynamic),
+            "note": (f"These places open a {group} whose name is computed at "
+                     "runtime; any of them may also use this node. Inspect "
+                     "them before a rename or delete."),
+            "items": dynamic[:_MAX_DYNAMIC],
+        }
+    return result
 
 
 def _action_path(g: _Graph, source_id: str, target_id: str) -> dict:
@@ -435,14 +448,6 @@ def _action_broken(g: _Graph, name: str | None) -> dict:
 _MAX_CHANGED = 50
 
 
-def _same_file(a: str, b: str) -> bool:
-    """Path equality that survives 8.3 short names and mapped drive vs UNC."""
-    try:
-        return os.path.samefile(a, b)
-    except OSError:
-        return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
-
-
 def _live_design_stamps(db: str | None) -> dict[str, str] | None:
     """Current design stamps, if this session already has ``db`` open.
 
@@ -450,7 +455,7 @@ def _live_design_stamps(db: str | None) -> dict[str, str] | None:
     """
     try:
         from .core import _Session
-        from .graph import design_stamps
+        from .graph import _same_file, design_stamps
         app = _Session._app
         if not db or app is None:
             return None

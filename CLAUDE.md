@@ -275,7 +275,7 @@ Macros have always been fully supported via the regular code tools — no dedica
 
 - **`GraphBuilder` class**: accumulates nodes (dict keyed by ID) and edges (list). Deduplicates edges via `_edge_dedup` set of `(from, to, kind, label)` tuples. Tracks `_name_targets` (defaultdict mapping lowercase names to possible node targets) for ambiguous reference resolution.
 - **8 node groups**: `table`, `query`, `form`, `report`, `macro`, `module`, `sql` (inline SQL), `field`.
-- **Edge kinds** (all point consumer → dependency): `relation`, `recordsource`, `recordsource-sql`, `controlsource`, `field-owner`, `field-lineage` (query output field → source field), `query-field` / `sql-field` (SQL names `Table.Field`), `sourceobject`, `rowsource`, `query-sql-reference`, `sql-reference`, `control-expression`, `expression-call` / `event-call` (`=Fn()` in a property → module), `event-macro` (`OnClick ="mcrX"`), `form-reference` (`Forms!frm!ctl` / `Reports!`), `vba-openform`, `vba-openreport`, `vba-openquery`, `vba-opentable`, `vba-querydefs`, `vba-runmacro`, `vba-runsql`, `vba-sourceobject`, `vba-type-ref`, `vba-data-ref`, `vba-call`, `macro-openform`, `macro-openreport`, `macro-openquery`, `macro-opentable`, `macro-runmacro`, `macro-runcode`, `macro-runsql`. Embedded macros reuse the `macro-*` kinds from the form/report with `meta.embedded = "<control>.<event>"`.
+- **Edge kinds** (all point consumer → dependency): `relation`, `recordsource`, `recordsource-sql`, `controlsource`, `field-owner`, `field-lineage` (query output field → source field), `query-field` / `sql-field` (SQL names `Table.Field`), `sourceobject`, `rowsource`, `query-sql-reference`, `sql-reference`, `control-expression`, `expression-call` / `event-call` (`=Fn()` in a property → module), `event-macro` (`OnClick ="mcrX"`), `form-reference` (`Forms!frm!ctl` / `Reports!`), `vba-openform`, `vba-openreport`, `vba-openquery`, `vba-opentable`, `vba-querydefs`, `vba-runmacro`, `vba-runsql`, `vba-sourceobject`, `vba-type-ref`, `vba-data-ref`, `vba-call`, `vba-field`, `macro-openform`, `macro-openreport`, `macro-openquery`, `macro-opentable`, `macro-runmacro`, `macro-runcode`, `macro-runsql`. Embedded macros reuse the `macro-*` kinds from the form/report with `meta.embedded = "<control>.<event>"`. A `library` node stands for a referenced library database (edges to it carry the procedure/object name).
 
 ### Phases (executed in `ac_graph`)
 
@@ -300,7 +300,19 @@ Macros have always been fully supported via the regular code tools — no dedica
 
 Scans VBA code for `DoCmd.Open*`/`RunMacro` (plain, parenthesised, or first named argument), `RunSQL` and `.Execute`/`.OpenRecordset` with a saved object name or inline SQL, `.QueryDefs("x")` on any database object, `SourceObject =` assignment, `Forms!frm!ctl` / `Forms("frm")`, type references (`As ClassName`, `New ClassName`), and data references (table/query names in string literals). All patterns are case-insensitive.
 
-Calls (`vba-call`): `Foo(`, `Call Foo`, and statement-start `Foo a, b` (`^`, `:`, `Then`, `Else`; not `Foo =`/`Foo.`). String literals and declaration lines are blanked first, and a same-named procedure in the calling module shadows the public one. Only **standard** modules are indexed (`index_module_procs`, `is_class` from `VBComponent.Type == 2`) — class methods need an instance.
+Calls (`vba-call`): `Foo(`, `Call Foo`, and statement-start `Foo a, b` (`^`, `:`, `Then`, `Else`; not `Foo =`/`Foo.`). String literals and declaration lines are blanked first, and a same-named procedure in the calling module shadows the public one. Only **standard** modules are indexed (`index_module_procs`, `is_class` from `VBComponent.Type == 2`) — class methods need an instance. `Eval("Fn()")` and `Application.Run "[Mod.]Proc"` also produce `vba-call`.
+
+### Names held in variables (`_VbaScope`)
+
+The first argument of `DoCmd.Open*`/`RunMacro`/`.QueryDefs(`/`Application.Run` is captured as written and classified (`_classify_arg`): a literal; an identifier resolved to the string literals it can hold (procedure-local assignments/Consts shadow module-level ones, then **Public/Global Consts of every standard module and library**, collected in `build_proc_index`); or an expression. Resolved edges carry `meta.via = <variable>`. Anything unresolvable is recorded in `meta.dynamicReferences` (`_record_dynamic`) and surfaced by `impact` for nodes of the same group — never as a `MissingReference`. This also stopped `DoCmd.OpenForm "frm" & x` from being read as a reference to `frm`.
+
+### Recordset / Me fields (`vba-field`)
+
+Per procedure, `Set v = …OpenRecordset(arg)` (name, single-source SQL, or a variable bound to one) and `Set v = Me.RecordsetClone` map `v` to a table/query with known fields; `v!X`, `v("X")`, `v.Fields("X")` and `!X`/`.Fields("X")` inside `With v` link to the field node. A variable re-pointed to a different source in the same procedure is dropped. Unknown field on a recordset → `MissingField` (a recordset `!X` can only be a field). In form/report code, `Me!X` / `Me("X")` / `Me.X` link only when X is a RecordSource field and not a control name, and never warn (`Me.X` is usually a property).
+
+### Library databases (`scan_vba_projects`)
+
+Runs before `build_proc_index`. Every `VBE.VBProjects` entry that is not the host (`_same_file`) and has an Access extension becomes a `library:<ProjectName>` node via `add_library`: its standard-module procs join the call index, its Public Consts join the constant pool, and its forms/reports (only those with a code module — `Form_x` components) resolve through `_resolve_named`'s last fallback. Locked projects get `meta.locked = true` and contribute nothing. Broken references (`Reference.IsBroken`) → `BrokenReference` warnings.
 
 ### Event properties (`_analyze_properties`)
 
@@ -310,7 +322,7 @@ Runs on every form/report via upstream's `_scan_control_properties` (wrapped val
 
 - Row-returning queries (`QueryDef.Type` in 0/16/128) record DAO `Fields` → `(Name, SourceTable, SourceField)` via `set_query_fields`. Enumeration failure → `QueryFieldsUnavailable` (usually a genuinely broken query).
 - In `referenced` mode lineage is **lazy**: creating a query field node (e.g. a control binds it) creates its source field node + `field-lineage` edge, recursively through query-on-query. `all` mode creates every query output field eagerly.
-- `_qualified_field_refs` finds `Table.Field` / `alias.Field` (FROM/JOIN aliases, string literals blanked) → `query-field` / `sql-field` edges to table field nodes. Unqualified names are not attributed.
+- `_qualified_field_refs` finds `Table.Field` / `alias.Field` (FROM/JOIN aliases, string literals blanked); `_bare_field_refs` attributes an unqualified name when exactly one source defines it (ambiguous names like `ID` across a join are skipped). Sources are the tables **and queries** the SQL names; query analysis is two-pass so query-on-query SQL sees every query's fields. Edges: `query-field` / `sql-field`.
 - A single-table inline SQL RecordSource binds controls to that table's fields; unknown names there are assumed to be aliases (no warning).
 - A control bound to a name that is not a field of its known table/query → `MissingField`. DAO names join-ambiguous columns `Table.Field`, so a qualified ControlSource is also tried whole.
 - `_ensure_field_node` never downgrades `verified`.

@@ -663,9 +663,10 @@
       module: { shape: 'triangle', color: { background: '#57606a', border: '#424a53', highlight: { background: '#6e7781', border: '#424a53' }, hover: { background: '#6e7781', border: '#424a53' } }, font: { color: '#fff' } },
       sql:    { shape: 'ellipse',  color: { background: '#54aeff', border: '#218bff', highlight: { background: '#80ccff', border: '#218bff' }, hover: { background: '#80ccff', border: '#218bff' } }, font: { color: '#000' } },
       field:  { shape: 'dot', size: 10, color: { background: '#afb8c1', border: '#8c959f', highlight: { background: '#d0d7de', border: '#8c959f' }, hover: { background: '#d0d7de', border: '#8c959f' } } },
+      library: { shape: 'star',   color: { background: '#6e7781', border: '#424a53', highlight: { background: '#8c959f', border: '#424a53' }, hover: { background: '#8c959f', border: '#424a53' } }, font: { color: '#fff' } },
     };
 
-    const groupLevels = { table: 0, query: 1, form: 2, report: 2, macro: 3, module: 4, sql: 1, field: 0 };
+    const groupLevels = { table: 0, query: 1, form: 2, report: 2, macro: 3, module: 4, library: 5, sql: 1, field: 0 };
 
     const edgeStyles = {
       'relation':           { color: '#888888', dashes: false, width: 2 },
@@ -703,6 +704,7 @@
       'event-macro':        { color: '#8250df', dashes: [6, 3], width: 1.5 },
       'macro-runmacro':     { color: '#8250df', dashes: false, width: 1.5 },
       'macro-runcode':      { color: '#8250df', dashes: [4, 4], width: 1.5 },
+      'vba-field':          { color: '#bf8700', dashes: [2, 3], width: 1 },
     };
     const defaultEdgeStyle = { color: '#aaaaaa', dashes: false, width: 1 };
 

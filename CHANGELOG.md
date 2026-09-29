@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.7.67
+
+**The four remaining blind spots.** Fork-only; no new tools (still **71**).
+Re-verified on a Northwind 2 copy: zero false warnings, graph fresh after
+build, 15 VBA field links, 82 more SQL field links.
+
+### Added
+
+- **Names held in variables and constants.** `DoCmd.OpenForm strX`,
+  `.QueryDefs(QRY)`, `Application.Run PROC` resolve through string literals
+  assigned in the procedure, module-level Consts, and Public Consts of every
+  standard module (and library). Edges carry `meta.via`. Names that are only
+  known at runtime (parameters, `TempVars`, concatenation) are recorded in
+  `meta.dynamicReferences`, and `impact` lists those of the same group under
+  `dynamic_references` — so an empty impact no longer hides them.
+- **`Eval("Fn()")` and `Application.Run "Proc"`** link to the module that
+  defines the procedure.
+- **Recordset fields in VBA** (`vba-field`): `rs!Phone`, `rs("Phone")`,
+  `rs.Fields("Phone")` and `!Phone` inside `With rs`, traced to the table/query
+  the recordset was opened on (`OpenRecordset` with a name, single-source SQL,
+  or a variable holding one; `Me.RecordsetClone`). A field that does not exist
+  on the source → `MissingField`. In form/report code, `Me!Phone` links to the
+  RecordSource field when it is not a control.
+- **Unqualified field names in SQL** are attributed when exactly one source
+  table or query defines them; query analysis is now two-pass so SQL over
+  another query sees its fields.
+- **Library databases**: referenced `.accda`/`.accdb`/`.mda` VBA projects
+  become `library` nodes; calls to their public procedures and opens of their
+  forms/reports link to them instead of being unknown or reported missing.
+  **`BrokenReference`** warnings for broken VBA references.
+
+### Fixed
+
+- `DoCmd.OpenForm "frm" & x` was read as a reference to a form named `frm`
+  (and could raise a false `MissingReference`); it is now a dynamic reference.
+- `.QueryDefs("x").Execute` and `DoCmd.OpenForm("x")` capture the name cleanly
+  (argument cut at the first unbalanced `)`).
+
 ## 0.7.66
 
 **The graph can now answer "what breaks if I rename this field?"** Closes the

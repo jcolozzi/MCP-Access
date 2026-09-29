@@ -17,8 +17,8 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from mcp_access.graph import (  # noqa: E402
-    GraphBuilder, _embedded_macro_blocks, _extract_record_source,
-    _qualified_field_refs, _strip_vba_comments,
+    GraphBuilder, _bare_field_refs, _embedded_macro_blocks,
+    _extract_record_source, _qualified_field_refs, _strip_vba_comments,
 )
 from mcp_access import graph_query  # noqa: E402
 from mcp_access.graph_query import ac_graph_query  # noqa: E402
@@ -629,3 +629,193 @@ def test_unverified_reference_never_downgrades_a_verified_field():
     gb._ensure_field_node("table:T", "table", "T", "X", False, None)
     meta = gb.nodes["field:table:T:X"]["meta"]
     assert meta["verified"] is True and meta["dataType"] == "Text"
+
+
+# ---------------------------------------------------------------------------
+# names held in variables / constants, and runtime-only names
+# ---------------------------------------------------------------------------
+
+def test_names_resolved_through_variables_and_constants():
+    gb = _builder_with("module:m", "form:frmA", "form:frmB", "form:frmMain",
+                       "query:qryX")
+    gb._global_consts["frm_main"] = {"frmMain"}  # Public Const in another module
+    code = (
+        'Private Const START_FORM = "frmA"\n'
+        "Sub One()\n"
+        "    DoCmd.OpenForm START_FORM\n"
+        "    DoCmd.OpenForm FRM_MAIN, acNormal\n"
+        '    CurrentDb.QueryDefs("qryX").Execute\n'
+        "End Sub\n"
+        "Sub Two()\n"
+        '    START_FORM = "frmB"\n'
+        '    DoCmd.OpenForm(START_FORM)\n'
+        "End Sub\n"
+    )
+    gb._analyze_code_heuristics("module:m", "module", "m", code, None)
+    opened = {(e["to"], e["meta"].get("via")) for e in _edges(gb, "vba-openform")}
+    assert opened == {("form:frmA", "START_FORM"), ("form:frmMain", "FRM_MAIN"),
+                      ("form:frmB", "START_FORM")}
+    assert [e["to"] for e in _edges(gb, "vba-querydefs")] == ["query:qryX"]
+    assert _missing(gb) == [] and gb.dynamic_refs == []
+
+
+def test_runtime_names_are_recorded_not_reported_missing():
+    gb = _builder_with("module:m", "form:frm")
+    code = (
+        "Sub Open(frmName As String)\n"
+        "    DoCmd.OpenForm frmName\n"
+        '    DoCmd.OpenForm "frm" & strSuffix\n'
+        "End Sub\n"
+    )
+    gb._analyze_code_heuristics("module:m", "module", "m", code, None)
+    assert _edges(gb, "vba-openform") == []  # the "frm" prefix is not a reference
+    assert _missing(gb) == []
+    assert {d["expr"] for d in gb.dynamic_refs} == {"frmName", '"frm" & strSuffix'}
+
+
+def test_impact_lists_dynamic_references_of_the_same_group(tmp_path):
+    gb = _builder_with("module:m", "form:frmA", "report:rptA")
+    gb._record_dynamic("module:m", "form", "OpenForm", "strForm")
+    path = os.path.join(str(tmp_path), "graph.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"meta": {"dynamicReferences": gb.dynamic_refs},
+                   "nodes": list(gb.nodes.values()), "edges": []}, f)
+    r = ac_graph_query("impact", graph_path=path, node="frmA")
+    assert r["dynamic_references"]["count"] == 1
+    assert r["dynamic_references"]["items"][0]["owner"] == "m"
+    r = ac_graph_query("impact", graph_path=path, node="rptA")
+    assert "dynamic_references" not in r
+
+
+def test_eval_and_application_run_link_to_procedures():
+    gb = _builder_with("module:m", "module:modB")
+    gb.index_module_procs("module:modB",
+                          "Public Sub DoWork()\nEnd Sub\nFunction Calc()\nEnd Function\n")
+    code = ('Application.Run "modB.DoWork"\n'
+            'x = Eval("Calc() * 2")\n')
+    gb._analyze_code_heuristics("module:m", "module", "m", code, None)
+    assert {e["meta"]["procedure"] for e in _edges(gb, "vba-call")} == {"DoWork", "Calc"}
+
+
+# ---------------------------------------------------------------------------
+# recordset and Me field references
+# ---------------------------------------------------------------------------
+
+def _rs_builder() -> GraphBuilder:
+    gb = _builder_with("module:m", "form:frmCust", "table:Customers")
+    gb._known_table_fields["Customers"] = {"ID": "Long", "Phone": "Text"}
+    gb.finalize_data_names()
+    return gb
+
+
+def _vba_fields(gb: GraphBuilder) -> set[str]:
+    return {e["to"] for e in _edges(gb, "vba-field")}
+
+
+def test_recordset_fields_are_traced_to_the_table():
+    gb = _rs_builder()
+    code = (
+        "Sub A()\n"
+        '    Set rs = CurrentDb.OpenRecordset("Customers")\n'
+        "    x = rs!Phone\n"
+        '    y = rs.Fields("ID")\n'
+        '    z = rs("Fax")\n'
+        "End Sub\n"
+        "Sub B()\n"
+        '    Set r2 = db.OpenRecordset("SELECT * FROM Customers WHERE ID > 0")\n'
+        "    With r2\n"
+        "        .MoveFirst\n"
+        "        q = ![Phone]\n"
+        "    End With\n"
+        "End Sub\n"
+    )
+    gb._analyze_code_heuristics("module:m", "module", "m", code, None)
+    assert _vba_fields(gb) == {"field:table:Customers:Phone",
+                               "field:table:Customers:ID"}
+    [w] = gb.warnings
+    assert w["code"] == "MissingField" and w["meta"]["field"] == "Fax"
+    assert w["meta"]["via"] == "rs!Fax"
+
+
+def test_repointed_recordset_is_not_attributed():
+    gb = _rs_builder()
+    code = (
+        "Sub A()\n"
+        '    Set rs = CurrentDb.OpenRecordset("Customers")\n'
+        '    Set rs = CurrentDb.OpenRecordset("SomethingElse")\n'
+        "    x = rs!Fax\n"
+        "End Sub\n"
+    )
+    gb._analyze_code_heuristics("module:m", "module", "m", code, None)
+    assert _edges(gb, "vba-field") == [] and gb.warnings == []
+
+
+def test_me_fields_and_recordsetclone_in_form_code():
+    gb = _rs_builder()
+    me = {"node_id": "table:Customers", "group": "table", "name": "Customers"}
+    code = (
+        "Private Sub Form_Current()\n"
+        "    x = Me!Phone & Me.txtPhone & Me.Caption\n"
+        "    Me.Requery\n"
+        "    Set rs = Me.RecordsetClone\n"
+        "    y = rs!ID\n"
+        "End Sub\n"
+    )
+    gb._analyze_code_heuristics("form:frmCust", "form", "frmCust", code, None,
+                                me_source=me, me_controls=frozenset({"txtphone"}))
+    assert _vba_fields(gb) == {"field:table:Customers:Phone",
+                               "field:table:Customers:ID"}
+    assert gb.warnings == []  # Me.Caption / Me.Requery are not flagged
+
+
+# ---------------------------------------------------------------------------
+# unqualified field names in SQL
+# ---------------------------------------------------------------------------
+
+def test_bare_field_refs_need_a_unique_owner():
+    sources = {"Customers": {"ID": "Long", "Phone": "Text"},
+               "Orders": {"ID": "Long", "OrderDate": "Date"}}
+    sql = ("SELECT Phone, OrderDate, ID, Sum(Qty) FROM Customers INNER JOIN Orders "
+           "ON Customers.ID = Orders.CustID WHERE Phone <> 'Phone x' "
+           "AND [OrderDate] > [Enter date]")
+    assert _bare_field_refs(sql, sources) == [
+        ("Customers", "Phone"), ("Orders", "OrderDate")]
+
+
+def test_query_on_query_bare_field_links_through_lineage():
+    gb = _lineage_builder()
+    gb.add_node("query:qryB", "qryB", "query", is_data=True)
+    gb.finalize_data_names()
+    gb._add_field_ref_edges("query:qryB", "SELECT Phone FROM qryCust", "query-field")
+    [e] = _edges(gb, "query-field")
+    assert e["to"] == "field:query:qryCust:Phone"
+    assert any(le["to"] == "field:table:Customers:Phone"
+               for le in _edges(gb, "field-lineage"))
+
+
+# ---------------------------------------------------------------------------
+# library databases
+# ---------------------------------------------------------------------------
+
+def test_library_procedures_forms_and_constants_resolve():
+    gb = _builder_with("module:m")
+    lib = gb.add_library("NWLib", r"C:\libs\NWLib.accda", {
+        "forms": ["frmLibAbout"], "reports": [],
+        "modules": {"modLib": 'Public Function LibFunc()\nEnd Function\n'
+                              'Public Const LIB_FORM = "frmLibAbout"\n'},
+    })
+    gb._compile_proc_call_re()
+    code = ('x = LibFunc()\n'
+            'DoCmd.OpenForm LIB_FORM\n'
+            'DoCmd.OpenForm "frmLibAbout"\n')
+    gb._analyze_code_heuristics("module:m", "module", "m", code, None)
+    assert [e["to"] for e in _edges(gb, "vba-call")] == [lib]
+    assert {e["to"] for e in _edges(gb, "vba-openform")} == {lib}
+    assert _missing(gb) == []
+    assert gb.nodes[lib]["meta"]["modules"] == ["modLib"]
+
+
+def test_locked_library_is_recorded():
+    gb = GraphBuilder()
+    lib = gb.add_library("Locked", r"C:\libs\Locked.accde", None)
+    assert gb.nodes[lib]["meta"]["locked"] is True
