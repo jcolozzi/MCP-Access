@@ -275,7 +275,7 @@ Macros have always been fully supported via the regular code tools — no dedica
 
 - **`GraphBuilder` class**: accumulates nodes (dict keyed by ID) and edges (list). Deduplicates edges via `_edge_dedup` set of `(from, to, kind, label)` tuples. Tracks `_name_targets` (defaultdict mapping lowercase names to possible node targets) for ambiguous reference resolution.
 - **8 node groups**: `table`, `query`, `form`, `report`, `macro`, `module`, `sql` (inline SQL), `field`.
-- **24+ edge kinds**: `relation`, `recordsource`, `recordsource-sql`, `controlsource`, `field-owner`, `sourceobject`, `rowsource`, `query-sql-reference`, `sql-reference`, `control-expression`, `vba-openform`, `vba-openreport`, `vba-openquery`, `vba-opentable`, `vba-querydefs`, `vba-runmacro`, `vba-runsql`, `vba-sourceobject`, `vba-type-ref`, `vba-data-ref`, `macro-openform`, `macro-openreport`, `macro-openquery`, `macro-runsql`.
+- **Edge kinds** (all point consumer → dependency): `relation`, `recordsource`, `recordsource-sql`, `controlsource`, `field-owner`, `field-lineage` (query output field → source field), `query-field` / `sql-field` (SQL names `Table.Field`), `sourceobject`, `rowsource`, `query-sql-reference`, `sql-reference`, `control-expression`, `expression-call` / `event-call` (`=Fn()` in a property → module), `event-macro` (`OnClick ="mcrX"`), `form-reference` (`Forms!frm!ctl` / `Reports!`), `vba-openform`, `vba-openreport`, `vba-openquery`, `vba-opentable`, `vba-querydefs`, `vba-runmacro`, `vba-runsql`, `vba-sourceobject`, `vba-type-ref`, `vba-data-ref`, `vba-call`, `macro-openform`, `macro-openreport`, `macro-openquery`, `macro-opentable`, `macro-runmacro`, `macro-runcode`, `macro-runsql`. Embedded macros reuse the `macro-*` kinds from the form/report with `meta.embedded = "<control>.<event>"`.
 
 ### Phases (executed in `ac_graph`)
 
@@ -298,7 +298,22 @@ Macros have always been fully supported via the regular code tools — no dedica
 
 ### VBA code heuristics (`_analyze_code_heuristics`)
 
-Scans VBA code for 7 `DoCmd.Open*`/`RunMacro` patterns, `RunSQL`/`Execute` with inline SQL, `SourceObject =` assignment, type references (`As ClassName`, `New ClassName`), and data references (table/query names in string literals). All patterns are case-insensitive.
+Scans VBA code for `DoCmd.Open*`/`RunMacro` (plain, parenthesised, or first named argument), `RunSQL` and `.Execute`/`.OpenRecordset` with a saved object name or inline SQL, `.QueryDefs("x")` on any database object, `SourceObject =` assignment, `Forms!frm!ctl` / `Forms("frm")`, type references (`As ClassName`, `New ClassName`), and data references (table/query names in string literals). All patterns are case-insensitive.
+
+Calls (`vba-call`): `Foo(`, `Call Foo`, and statement-start `Foo a, b` (`^`, `:`, `Then`, `Else`; not `Foo =`/`Foo.`). String literals and declaration lines are blanked first, and a same-named procedure in the calling module shadows the public one. Only **standard** modules are indexed (`index_module_procs`, `is_class` from `VBComponent.Type == 2`) — class methods need an instance.
+
+### Event properties (`_analyze_properties`)
+
+Runs on every form/report via upstream's `_scan_control_properties` (wrapped values joined). Any property value starting with `=` is scanned for calls to indexed public functions (`event-call` for `On*`/`Before*`/`After*`, else `expression-call`) and for `Forms!` references. A non-`[`…`]` event value is a macro name (`event-macro`, or `MissingReference`). `OnXxxEmMacro = Begin` blocks are extracted by `_embedded_macro_blocks` (owner `Name` resolved when the block closes) and parsed by `_analyze_macro_lines`, the same parser standalone macros use.
+
+### Field lineage
+
+- Row-returning queries (`QueryDef.Type` in 0/16/128) record DAO `Fields` → `(Name, SourceTable, SourceField)` via `set_query_fields`. Enumeration failure → `QueryFieldsUnavailable` (usually a genuinely broken query).
+- In `referenced` mode lineage is **lazy**: creating a query field node (e.g. a control binds it) creates its source field node + `field-lineage` edge, recursively through query-on-query. `all` mode creates every query output field eagerly.
+- `_qualified_field_refs` finds `Table.Field` / `alias.Field` (FROM/JOIN aliases, string literals blanked) → `query-field` / `sql-field` edges to table field nodes. Unqualified names are not attributed.
+- A single-table inline SQL RecordSource binds controls to that table's fields; unknown names there are assumed to be aliases (no warning).
+- A control bound to a name that is not a field of its known table/query → `MissingField`. DAO names join-ambiguous columns `Table.Field`, so a qualified ControlSource is also tried whole.
+- `_ensure_field_node` never downgrades `verified`.
 
 ### SQL reference extraction (`_extract_sql_references`)
 
@@ -327,9 +342,9 @@ Node resolution: accepts exact ids (`table:Customers`), bare names (`Customers`)
 
 `skip_fields=true` (default) excludes `field-owner` edges to reduce noise. Results capped at 200 items.
 
-Every result carries `graph: {generatedAt, stale}`. `stale` compares the `.accdb` mtime to `meta.databaseMtime` recorded at build time (server-side file times, so no clock skew); any design **or data** write trips it. `null` for graphs built before 0.7.65.
+Every result carries `graph: {generatedAt, stale}`. The build snapshots `meta.designStamps` (node id → DAO `LastUpdated` for tables/queries, `AccessObject.DateModified` for forms/reports/macros/modules) **last**, after all analysis. A query compares it to the live session's stamps and lists `changed`/`added`/`removed`. Do NOT go back to the file mtime: Access rewrites the `.accdb` when it closes, so mtime flagged every graph stale (measured on Northwind in 0.7.65). `stale: null` when the database is not open in this session (the query never opens it) or the graph predates 0.7.66. The open-database check uses `os.path.samefile`: `CurrentProject.FullName` is the long path while `db_path` may be 8.3 short or UNC.
 
-`MissingReference` is emitted only for **literal** names (VBA `DoCmd.Open*`/`RunMacro`/`QueryDefs("x")`/`.SourceObject =`, control SourceObject, macro actions). VBA is comment-stripped (`_strip_vba_comments`) before any heuristic runs, so commented-out code creates neither edges nor warnings. Macro arguments starting with `=` are expressions and are skipped.
+`MissingReference` is emitted only for **literal** names (VBA `DoCmd.Open*`/`RunMacro`/`QueryDefs("x")`/`.SourceObject =`/`Forms!x`, control SourceObject, event-property macro names, macro actions incl. embedded, `Forms!x` in SQL). VBA is comment-stripped (`_strip_vba_comments`) before any heuristic runs, so commented-out code creates neither edges nor warnings. Macro arguments starting with `=` are expressions and are skipped.
 
 **Recommended agent workflow**: run `access_graph` once, then use `access_graph_query` for targeted lookups before any mutation; after the edit, rebuild and check `broken`. The same guidance ships to every client as `access_tips('graph')`.
 

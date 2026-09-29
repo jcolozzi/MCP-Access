@@ -1648,10 +1648,12 @@ TOOLS = [
         name="access_graph",
         description=(
             "Build a dependency graph of the entire Access database — tables, "
-            "queries, forms, reports, macros, modules. Detects relationships, "
-            "RecordSource, ControlSource, SourceObject, RowSource, VBA code "
-            "heuristics (DoCmd.Open*, RunSQL, type refs, data refs), and "
-            "macro actions. Outputs graph.json + an interactive HTML viewer "
+            "queries, forms, reports, macros, modules, and fields. Detects "
+            "relationships, RecordSource, ControlSource, SourceObject, RowSource, "
+            "field lineage through queries, event properties (=Fn(), macro "
+            "names, embedded macros), Forms!frm!ctl references, VBA code "
+            "heuristics (DoCmd.Open*, RunSQL, Execute, calls, type refs, data "
+            "refs), and macro actions. Outputs graph.json + an interactive HTML viewer "
             "with analytical reports (broken objects, orphans, inline-SQL "
             "inventory, linked tables, high fan-in, duplicate SQL, unverified "
             "field bindings, circular dependencies, complexity hotspots, tables "
@@ -1710,7 +1712,8 @@ TOOLS = [
             "between two nodes), orphans (nodes with no incoming edges), "
             "summary (stats + top-degree nodes), broken (references to objects "
             "that do not exist + other build warnings; pass node to filter by "
-            "owner or target name). Every result has graph.stale — when true, "
+            "owner or target name). Every result has graph.stale (per-object "
+            "design timestamps; lists what changed) — when true, "
             "re-run access_graph before relying on it. See access_tips('graph')."
         ),
         inputSchema={

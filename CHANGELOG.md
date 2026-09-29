@@ -1,5 +1,61 @@
 # Changelog
 
+## 0.7.66
+
+**The graph can now answer "what breaks if I rename this field?"** Closes the
+detection gaps from the graph review. Fork-only; no new tools (still **71**).
+Verified end to end on a copy of Northwind 2 (571 nodes, 1,782 edges, 215
+lineage edges, zero spurious warnings).
+
+### Added
+
+- **Field lineage through queries.** Row-returning queries record their DAO
+  output fields with `SourceTable`/`SourceField`; a query field bound by a
+  control links (`field-lineage`) to the table field it comes from, recursively
+  through query-on-query. SQL naming `Table.Field` / `alias.Field` adds
+  `query-field` / `sql-field` edges, which covers WHERE/JOIN/ORDER BY and action
+  queries. `impact` on a table field now reaches the forms and reports bound
+  through queries. A single-table SQL RecordSource binds controls to that
+  table's fields.
+- **`MissingField` warning** — a control bound to a name that is not a field of
+  its table/query. With `broken`, this is what a field rename leaves behind.
+  **`QueryFieldsUnavailable`** when DAO cannot resolve a query's columns —
+  usually a broken query.
+- **Event properties and embedded macros.** `OnClick ="=MyFunc()"` (and any
+  `=` expression property) links to the module defining the function
+  (`event-call` / `expression-call`); `OnClick ="mcrX"` links to the macro
+  (`event-macro`) or reports it missing; `OnXxxEmMacro` blocks are parsed like
+  standalone macros. Functions and macros used only from buttons no longer look
+  like orphans.
+- **`Forms!frm!ctl` / `Reports!rpt` references** in saved-query SQL, inline
+  SQL, property expressions and VBA (`Forms("x")` too) → `form-reference`,
+  with the target control in `meta.targetControl`. Renaming a control or form
+  now shows the queries that break.
+- **Macros**: `RunMacro` (incl. `grp.sub`) and `RunCode` actions.
+- **VBA**: `DoCmd.Open*` with parentheses or a named first argument;
+  `.Execute` / `.OpenRecordset` with a saved object or inline SQL;
+  `.QueryDefs("x")` on any database variable.
+- Viewer styles for the new edge kinds.
+
+### Fixed
+
+- **Sub calls without parentheses** (`DoWork 1, 2`, `If x Then Helper`) are
+  detected; only `Foo(` and `Call Foo` were before. String literals and
+  declaration lines are blanked before matching, and a same-named procedure in
+  the calling module shadows the public one.
+- **Class-module methods are no longer indexed as global functions** — any
+  `Init(` anywhere used to link to every class with an `Init`.
+- `vba-call` edges are labelled with the procedure, so two calls into the same
+  module no longer collapse into one edge that names only the first.
+- **Staleness no longer uses the file mtime.** Measured on Northwind: Access
+  rewrites the `.accdb` when it closes, so 0.7.65 flagged every graph stale.
+  The build now snapshots per-object design timestamps (DAO `LastUpdated`,
+  `AccessObject.DateModified`); `stale` ignores data edits and closes, and
+  lists exactly which objects changed, were added or removed. It is `null`
+  when the database is not open in the session. Graphs built by 0.7.65 must be
+  rebuilt to get it.
+- An unverified reference no longer downgrades a verified field node.
+
 ## 0.7.65
 
 **The dependency graph answered "what breaks?" backwards.** Fork-only fixes to

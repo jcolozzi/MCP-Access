@@ -228,8 +228,10 @@ def _action_impact(g: _Graph, node_id: str, skip_fields: bool) -> dict:
             edges_used.append(_fmt_edge(e))
             if source not in visited:
                 visited.add(source)
-                affected.append({**_fmt_node(g.nodes[source]), "depth": d + 1})
                 frontier.append((source, d + 1))
+                # Query fields reached via field-lineage are walked, not listed.
+                if not (skip_fields and g.nodes[source]["group"] == "field"):
+                    affected.append({**_fmt_node(g.nodes[source]), "depth": d + 1})
 
     truncated = len(affected) >= _MAX_RESULTS
 
@@ -430,29 +432,59 @@ def _action_broken(g: _Graph, name: str | None) -> dict:
     }
 
 
-_MTIME_TOLERANCE_SEC = 2  # FAT/SMB timestamp granularity
+_MAX_CHANGED = 50
 
 
-def _freshness(g: _Graph, db_path: str | None) -> dict:
-    """Whether the database file changed after the graph was built."""
+def _same_file(a: str, b: str) -> bool:
+    """Path equality that survives 8.3 short names and mapped drive vs UNC."""
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+
+def _live_design_stamps(db: str | None) -> dict[str, str] | None:
+    """Current design stamps, if this session already has ``db`` open.
+
+    Never opens a database itself: a query must not have that side effect.
+    """
+    try:
+        from .core import _Session
+        from .graph import design_stamps
+        app = _Session._app
+        if not db or app is None:
+            return None
+        if not _same_file(str(app.CurrentProject.FullName), db):
+            return None
+        return design_stamps(app, app.CurrentDb())
+    except Exception:
+        return None
+
+
+def _freshness(g: _Graph, live: dict[str, str] | None) -> dict:
+    """Which objects changed design since the graph was built."""
     out: dict[str, Any] = {"generatedAt": g.meta.get("generatedAt")}
-    built = g.meta.get("databaseMtime")
-    db = db_path or g.meta.get("database")
-    current = None
-    if db:
-        try:
-            current = os.path.getmtime(db)
-        except OSError:
-            pass
-    if built is None or current is None:
+    built = g.meta.get("designStamps")
+    if not built:
         out["stale"] = None
+        out["note"] = ("This graph predates design tracking; re-run "
+                       "access_graph to enable staleness checks.")
         return out
-    out["stale"] = current > built + _MTIME_TOLERANCE_SEC
+    if live is None:
+        out["stale"] = None
+        out["note"] = ("Not checked: the database is not open in this session. "
+                       "Any other access_* call on it opens it.")
+        return out
+    changed = sorted(k for k in built.keys() & live.keys() if built[k] != live[k])
+    added = sorted(live.keys() - built.keys())
+    removed = sorted(built.keys() - live.keys())
+    out["stale"] = bool(changed or added or removed)
     if out["stale"]:
-        out["note"] = (
-            "The database file changed after this graph was built (design or "
-            "data). Re-run access_graph before relying on it for an edit."
-        )
+        out["changed"] = changed[:_MAX_CHANGED]
+        out["added"] = added[:_MAX_CHANGED]
+        out["removed"] = removed[:_MAX_CHANGED]
+        out["note"] = ("Objects changed design since this graph was built. "
+                       "Re-run access_graph before relying on it for an edit.")
     return out
 
 
@@ -532,5 +564,6 @@ def ac_graph_query(
             f"Valid actions: neighbors, impact, path, orphans, summary, broken"
         )
 
-    result["graph"] = _freshness(g, db_path)
+    result["graph"] = _freshness(
+        g, _live_design_stamps(db_path or g.meta.get("database")))
     return result

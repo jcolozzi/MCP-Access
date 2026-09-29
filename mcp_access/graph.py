@@ -23,7 +23,7 @@ from typing import Any
 
 from .code import ac_get_code, ac_list_objects
 from .constants import CTRL_TYPE, DAO_FIELD_TYPE
-from .controls import _get_parsed_controls
+from .controls import _get_parsed_controls, _scan_control_properties
 from .core import _Session
 from .helpers import join_wrapped_value, split_code_behind
 
@@ -38,30 +38,75 @@ _SQL_START_RE = re.compile(
 _RECORDSOURCE_RE = re.compile(r"^\s+RecordSource\s*=\s*(.*?)\s*$")
 
 # VBA DoCmd / QueryDefs patterns  (case-insensitive, dot-all)
+# Optional "(" and a leading named argument: DoCmd.OpenForm(FormName:="x")
+_DOCMD_ARG = r'\s*\(?\s*(?:\w+\s*:=\s*)?"((?:[^"]|"")+)"'
 _VBA_PATTERNS: list[dict[str, str]] = [
-    {"regex": r'\bDoCmd\.OpenForm\s+"((?:[^"]|"")+)"',
+    {"regex": r'\bDoCmd\.OpenForm' + _DOCMD_ARG,
      "group": "form",  "label": "OpenForm",  "kind": "vba-openform"},
-    {"regex": r'\bDoCmd\.OpenReport\s+"((?:[^"]|"")+)"',
+    {"regex": r'\bDoCmd\.OpenReport' + _DOCMD_ARG,
      "group": "report", "label": "OpenReport", "kind": "vba-openreport"},
-    {"regex": r'\bDoCmd\.OpenQuery\s+"((?:[^"]|"")+)"',
+    {"regex": r'\bDoCmd\.OpenQuery' + _DOCMD_ARG,
      "group": "query",  "label": "OpenQuery",  "kind": "vba-openquery"},
-    {"regex": r'\bDoCmd\.OpenTable\s+"((?:[^"]|"")+)"',
+    {"regex": r'\bDoCmd\.OpenTable' + _DOCMD_ARG,
      "group": "table",  "label": "OpenTable",  "kind": "vba-opentable"},
-    {"regex": r'\bCurrentDb\s*\(\s*\)\s*\.\s*QueryDefs\s*\(\s*"((?:[^"]|"")+)"\s*\)',
+    {"regex": r'\.\s*QueryDefs\s*\(\s*"((?:[^"]|"")+)"\s*\)',
      "group": "query",  "label": "QueryDefs", "kind": "vba-querydefs"},
-    {"regex": r'\bDBEngine\s*\(\s*0\s*\)\s*\(\s*0\s*\)\s*\.\s*QueryDefs\s*\(\s*"((?:[^"]|"")+)"\s*\)',
-     "group": "query",  "label": "QueryDefs", "kind": "vba-querydefs"},
-    {"regex": r'\bDoCmd\.RunMacro\s+"((?:[^"]|"")+)"',
+    {"regex": r'\bDoCmd\.RunMacro' + _DOCMD_ARG,
      "group": "macro",  "label": "RunMacro",  "kind": "vba-runmacro"},
 ]
 
 _VBA_RUNSQL_RE = re.compile(
-    r'\bDoCmd\.RunSQL\s+"((?:[^"]|"")+)"', re.I | re.S
+    r'\bDoCmd\.RunSQL' + _DOCMD_ARG, re.I | re.S
+)
+# db.Execute "qryX" / "UPDATE ..." and db.OpenRecordset("tbl" | "SELECT ...")
+_VBA_SQL_CALL_RE = re.compile(
+    r'\.\s*(Execute|OpenRecordset)\s*\(?\s*"((?:[^"]|"")+)"', re.I
 )
 _VBA_SOURCEOBJECT_RE = re.compile(
     r'\.SourceObject\s*=\s*"((?:[^"]|"")+)"', re.I | re.M
 )
 _VBA_STRING_LITERAL_RE = re.compile(r'"((?:[^"]|"")*)"')
+
+# Forms!frm!ctl, [Forms]![frm X].[ctl], Reports!rpt — in SQL, expressions, VBA
+_OBJ_BANG_REF_RE = re.compile(
+    r"\[?\b(Forms|Reports)\]?\s*!\s*(?:\[([^\]]+)\]|(\w+))"
+    r"(?:\s*[!.]\s*(?:\[([^\]]+)\]|(\w+)))?",
+    re.I,
+)
+_VBA_OBJ_PAREN_REF_RE = re.compile(
+    r'\b(Forms|Reports)\s*\(\s*"((?:[^"]|"")+)"\s*\)', re.I
+)
+# Name( inside an expression, but not obj.Name( or [x]!Name(
+_EXPR_CALL_RE = re.compile(r"(?<![.\w!\]])([A-Za-z_]\w*)\s*\(")
+_EVENT_PROP_RE = re.compile(r"^(?:On|Before|After)[A-Z]\w*$")
+_EM_MACRO_RE = re.compile(r"^(\w+)EmMacro\s*=\s*Begin\s*$")
+_BLOCK_OPEN_RE = re.compile(r"^(?:Begin\b|\w+\s*=\s*Begin\s*$)")
+_NAME_PROP_RE = re.compile(r'^Name\s*=\s*"?(.*?)"?\s*$')
+_VBA_DECL_LINE_RE = re.compile(
+    r"^[ \t]*(?:(?:Public|Private|Friend|Static|Global)[ \t]+)*"
+    r"(?:Sub|Function|Property[ \t]+(?:Get|Let|Set)|Declare)\b.*$",
+    re.I | re.M,
+)
+
+# SQL: Table.Field / [Table].[Field] / alias.Field, and FROM/JOIN aliases
+_SQL_NAME = r"(?:\[([^\]]+)\]|([A-Za-z_]\w*))"
+_SQL_QUAL_REF_RE = re.compile(_SQL_NAME + r"\s*\.\s*(?:\[([^\]]+)\]|([A-Za-z_]\w*))")
+_SQL_ALIAS_RE = re.compile(
+    r"(?:\bFROM|\bJOIN|,)\s*" + _SQL_NAME
+    + r"\s+(?:AS\s+)?(?:\[([^\]]+)\]|([A-Za-z_]\w*))",
+    re.I,
+)
+_SQL_STRING_RE = re.compile(r'"[^"]*"|\'[^\']*\'')
+_SQL_KEYWORDS = {
+    "AS", "ON", "INNER", "LEFT", "RIGHT", "OUTER", "FULL", "CROSS", "JOIN",
+    "WHERE", "GROUP", "ORDER", "HAVING", "UNION", "IN", "FROM", "SELECT",
+    "SET", "INTO", "VALUES", "AND", "OR", "NOT", "BY", "WITH", "PIVOT",
+    "TRANSFORM", "TOP", "DISTINCT",
+}
+
+# DAO QueryDef.Type values whose Fields describe output columns:
+# dbQSelect, dbQCrosstab, dbQSetOperation (UNION)
+_DAO_ROW_QUERY_TYPES = {0, 16, 128}
 
 # Macro action/argument patterns
 _MACRO_ACTION_RE = re.compile(r'^\s*Action\s*=\s*"?([A-Za-z0-9_]+)"?\s*$')
@@ -72,6 +117,7 @@ _MACRO_ACTIONS: dict[str, tuple[str, str, str]] = {
     "OpenReport": ("report", "OpenReport", "macro-openreport"),
     "OpenQuery":  ("query",  "OpenQuery",  "macro-openquery"),
     "OpenTable":  ("table",  "OpenTable",  "macro-opentable"),
+    "RunMacro":   ("macro",  "RunMacro",   "macro-runmacro"),
 }
 
 # Regex to extract Public Sub/Function/Property declarations from VBA code.
@@ -156,11 +202,17 @@ class GraphBuilder:
         self._name_targets: dict[str, list[dict]] = defaultdict(list)
         # table_name -> {field_name: data_type_str}
         self._known_table_fields: dict[str, dict[str, str]] = {}
+        # query_name -> {output field: data_type_str}, from DAO QueryDef.Fields
+        self._known_query_fields: dict[str, dict[str, str]] = {}
+        # query_name -> {output field lower: (SourceTable, SourceField)}
+        self._query_lineage: dict[str, dict[str, tuple[str, str]]] = {}
         # sha256 -> node_id
         self._sql_cache: dict[str, str] = {}
 
         self.warnings: list[dict] = []
         self._missing_seen: set[tuple] = set()
+        # node id -> design timestamp at build time (see design_stamps)
+        self.design_stamps: dict[str, str] = {}
         self.field_mode = field_mode
 
         # Raw SaveAsText export mode: "none" (compute rawHash/rawSize only)
@@ -367,6 +419,8 @@ class GraphBuilder:
 
         # Add reference edges from SQL node to known data names
         self._add_sql_reference_edges(sql_text, node_id, sql_dir)
+        self._add_field_ref_edges(node_id, sql_text, "sql-field")
+        self._link_object_refs(node_id, sql_text, {"via": "SQL"})
         return node_id
 
     def _merge_sql_origin(self, node_id: str, origin: str) -> None:
@@ -393,6 +447,69 @@ class GraphBuilder:
                     {"name": name},
                 )
 
+    def _add_field_ref_edges(self, from_id: str, sql: str, kind: str) -> None:
+        """Edges to the table fields a SQL statement names as Table.Field."""
+        for table, field in _qualified_field_refs(sql, self._known_table_fields):
+            fid = self._ensure_field_node(
+                self._object_id("table", table), "table", table, field,
+                True, self._known_table_fields[table][field],
+            )
+            if fid:
+                self.add_edge(from_id, fid, field, kind, "to",
+                              {"field": f"{table}.{field}"})
+
+    def _link_object_refs(
+        self, owner_id: str, text: str, meta: dict | None = None,
+        *, vba: bool = False,
+    ) -> None:
+        """Edges for Forms!frm!ctl / Reports!rpt (and Forms("x") in VBA)."""
+        refs: list[tuple[str, str, str | None]] = []
+        for m in _OBJ_BANG_REF_RE.finditer(text):
+            ctl = m.group(4) or m.group(5)
+            if ctl and ctl.lower() in ("form", "report"):
+                ctl = None  # Forms!frmMain.Form!sub — the subform property
+            refs.append((m.group(1), m.group(2) or m.group(3), ctl))
+        if vba:
+            for m in _VBA_OBJ_PAREN_REF_RE.finditer(text):
+                refs.append((m.group(1), m.group(2).replace('""', '"'), None))
+        for coll, name, ctl in refs:
+            group = "form" if coll.lower() == "forms" else "report"
+            target_id = self._resolve_named(group, name)
+            if target_id == owner_id:
+                continue
+            if not target_id:
+                self._warn_missing(owner_id, group, name, f"{coll}! reference")
+                continue
+            edge_meta = {**(meta or {}), "name": name}
+            if ctl:
+                edge_meta["targetControl"] = ctl
+            self.add_edge(owner_id, target_id, f"{coll.capitalize()}!{ctl or ''}",
+                          "form-reference", "to", edge_meta)
+
+    def _link_function_calls(
+        self, owner_id: str, expr: str, label: str, kind: str, meta: dict,
+    ) -> None:
+        """Edges to modules defining the public functions called in an expression."""
+        if not self._proc_index:
+            return
+        for m in _EXPR_CALL_RE.finditer(_blank_string_literals(expr)):
+            name = m.group(1)
+            low = name.lower()
+            if low in _VBA_BUILTIN_NAMES:
+                continue
+            for tid in self._proc_index.get(low, []):
+                if tid != owner_id:
+                    self.add_edge(owner_id, tid, label, kind, "to",
+                                  {**meta, "procedure": name})
+
+    def _fields_of(self, group: str, name: str) -> dict[str, str] | None:
+        """Known fields of a table/query, or None when they are unknown."""
+        if group == "table":
+            return self._known_table_fields.get(name)
+        if group == "query":
+            return self._known_query_fields.get(name)
+        return None
+
     # ── field node helpers ──────────────────────────────────────────────
 
     def _ensure_field_node(
@@ -408,6 +525,14 @@ class GraphBuilder:
         if self.field_mode == "none":
             return None
         node_id = f"field:{owner_group}:{owner_name}:{field_name}"
+        existing = self.nodes.get(node_id)
+        if existing is not None:
+            # Never downgrade: a later unverified reference must not unset it.
+            meta = existing["meta"]
+            meta["verified"] = bool(meta.get("verified")) or verified
+            if data_type and not meta.get("dataType"):
+                meta["dataType"] = data_type
+            return node_id
         self.add_node(node_id, field_name, "field", meta={
             "ownerId": owner_id,
             "ownerGroup": owner_group,
@@ -418,7 +543,42 @@ class GraphBuilder:
         })
         self.add_edge(owner_id, node_id, "field", "field-owner", "to",
                       {"owner": owner_name, "field": field_name})
+        if owner_group == "query":
+            self._link_field_lineage(owner_name, field_name)
         return node_id
+
+    def set_query_fields(
+        self, query_name: str, fields: list[tuple[str, str, str, str]]
+    ) -> None:
+        """Record DAO output fields: (name, SourceTable, SourceField, data type)."""
+        self._known_query_fields[query_name] = {n: dt for n, _, _, dt in fields}
+        self._query_lineage[query_name] = {
+            n.lower(): (st, sf) for n, st, sf, _ in fields if st and sf
+        }
+
+    def _link_field_lineage(self, query_name: str, field_name: str) -> None:
+        """Link a query output field to the table/query field it comes from."""
+        src = self._query_lineage.get(query_name, {}).get(field_name.lower())
+        if not src:
+            return
+        source_name, source_field = src
+        targets = self._targets_for_name(source_name, data_only=True)
+        query_id = self._object_id("query", query_name)
+        if not targets or targets[0]["node_id"] == query_id:
+            return
+        t = targets[0]
+        known = self._fields_of(t["group"], t["name"])
+        hit = _lookup_field(known, source_field) if known is not None else None
+        src_fid = self._ensure_field_node(
+            t["node_id"], t["group"], t["name"],
+            hit[0] if hit else source_field, bool(hit), hit[1] if hit else None,
+        )
+        if src_fid:
+            self.add_edge(
+                f"field:query:{query_name}:{field_name}", src_fid, "from",
+                "field-lineage", "to",
+                {"source": f"{source_name}.{source_field}"},
+            )
 
     # ── Phase 2: scan objects ───────────────────────────────────────────
 
@@ -556,50 +716,63 @@ class GraphBuilder:
 
             # Read module code (cache for later heuristic analysis)
             code = ""
+            is_class = False
             try:
                 cm = _get_code_module(app, "module", mod_name)
                 code = _cm_all_code(cm, f"module:{mod_name}")
+                try:
+                    is_class = int(cm.Parent.Type) == 2  # vbext_ct_ClassModule
+                except Exception:
+                    pass
             except Exception:
                 try:
                     code = ac_get_code(db_path, "module", mod_name)
+                    is_class = code.lstrip().upper().startswith("VERSION 1.0 CLASS")
                 except Exception:
                     continue
             if not code:
                 continue
 
             self._module_code_cache[mod_name] = code
+            self.index_module_procs(node_id, code, is_class=is_class)
 
-            # Find all Private proc names so we can exclude them
-            private_names = {
-                m.group(1).lower()
-                for m in _VBA_PRIVATE_PROC_RE.finditer(code)
-            }
+        self._compile_proc_call_re()
 
-            # Find all proc declarations (Public or implicit Public)
-            for m in _VBA_PROC_DECL_RE.finditer(code):
-                proc_name = m.group(1)
-                pname_lower = proc_name.lower()
-                # Skip Private procs, built-ins, and very short names
-                if pname_lower in private_names:
-                    continue
-                if pname_lower in _VBA_BUILTIN_NAMES:
-                    continue
-                if len(pname_lower) < 2:
-                    continue
+    def index_module_procs(
+        self, node_id: str, code: str, *, is_class: bool = False
+    ) -> None:
+        """Add a standard module's public procedures to the call index.
+
+        Class modules are skipped: their methods are only reachable through an
+        instance (obj.Method), which the call regex deliberately ignores.
+        """
+        if is_class:
+            return
+        private_names = {
+            m.group(1).lower() for m in _VBA_PRIVATE_PROC_RE.finditer(code)
+        }
+        for m in _VBA_PROC_DECL_RE.finditer(code):
+            pname_lower = m.group(1).lower()
+            if (pname_lower in private_names
+                    or pname_lower in _VBA_BUILTIN_NAMES
+                    or len(pname_lower) < 2):
+                continue
+            if node_id not in self._proc_index[pname_lower]:
                 self._proc_index[pname_lower].append(node_id)
 
-        # Build compiled regex for call detection
+    def _compile_proc_call_re(self) -> None:
         proc_names = sorted(self._proc_index.keys(), key=len, reverse=True)
-        if proc_names:
-            escaped = [re.escape(n) for n in proc_names]
-            alt = "|".join(escaped)
-            # Match bare calls: ProcName( — but NOT object.ProcName(
-            # Also match: Call ProcName
-            self._proc_call_re = re.compile(
-                rf"(?<![.\w])(?:{alt})\s*\("
-                rf"|\bCall\s+(?:{alt})\b",
-                re.IGNORECASE,
-            )
+        if not proc_names:
+            self._proc_call_re = None
+            return
+        alt = "|".join(re.escape(n) for n in proc_names)
+        # Foo(...)  |  Call Foo  |  Foo a, b  (statement start, not Foo = / Foo.x)
+        self._proc_call_re = re.compile(
+            rf"(?<![.\w])(?P<paren>{alt})\s*\("
+            rf"|\bCall\s+(?P<call>{alt})\b"
+            rf"|(?:^|:|\bThen\b|\bElse\b)[ \t]*(?P<stmt>{alt})\b(?![ \t]*[=(.!:])",
+            re.IGNORECASE | re.MULTILINE,
+        )
 
     # ── Phase 3: form/report edge detection ─────────────────────────────
 
@@ -667,6 +840,46 @@ class GraphBuilder:
                 object_id, group, name, vba_code, sql_dir
             )
 
+        # --- Event properties, expressions, embedded macros ---
+        self._analyze_properties(object_id, export_text, sql_dir)
+
+    def _analyze_properties(
+        self, owner_id: str, export_text: str, sql_dir: str | None
+    ) -> None:
+        try:
+            props = _scan_control_properties(export_text)
+        except Exception:
+            props = []
+        for p in props:
+            value = p["value"].strip()
+            if not value:
+                continue
+            prop, ctrl = p["property"], p["control"]
+            where = f"{ctrl}.{prop}" if ctrl else prop
+            meta: dict[str, Any] = {"property": prop}
+            if ctrl:
+                meta["controlName"] = ctrl
+            is_event = bool(_EVENT_PROP_RE.match(prop))
+            if value.startswith("="):
+                self._link_function_calls(
+                    owner_id, value, where,
+                    "event-call" if is_event else "expression-call", meta,
+                )
+                self._link_object_refs(owner_id, value, meta)
+            elif is_event and not value.startswith("["):
+                # [Event Procedure] / [Embedded Macro] start with "["; else a macro name
+                target_id = self._resolve_named("macro", value)
+                if target_id:
+                    self.add_edge(owner_id, target_id, where, "event-macro",
+                                  "to", {**meta, "macro": value})
+                else:
+                    self._warn_missing(owner_id, "macro", value, where)
+        for block in _embedded_macro_blocks(export_text):
+            where = (f"{block['control']}.{block['property']}"
+                     if block["control"] else block["property"])
+            self._analyze_macro_lines(owner_id, block["lines"], sql_dir,
+                                      {"embedded": where})
+
     def _resolve_record_source(
         self,
         owner_id: str,
@@ -697,7 +910,13 @@ class GraphBuilder:
             )
             self.add_edge(owner_id, sql_id, "RecordSource",
                           "recordsource-sql", "to")
-            return None  # no single target ref for field resolution
+            # A single-table SQL RecordSource binds fields of that table.
+            names = _find_referenced_data_names(record_source,
+                                                self._known_data_names)
+            table = (names[0] if len(names) == 1
+                     and names[0] in self._known_table_fields else None)
+            return {"node_id": sql_id, "group": "sql", "name": sql_id,
+                    "table": table}
 
         self.add_warning(
             "UnresolvedRecordSource",
@@ -764,37 +983,50 @@ class GraphBuilder:
         sql_dir: str | None,
     ) -> None:
         field_name = _field_from_control_source(control_source)
+        meta = {"controlName": ctrl_name, "controlType": ctrl_type,
+                "controlSource": control_source}
 
         if field_name and rs_target:
-            owner_group = rs_target["group"]
-            owner_name = rs_target["name"]
-            target_node = rs_target["node_id"]
-
-            verified = False
-            data_type: str | None = None
-            if owner_group == "table":
-                fields = self._known_table_fields.get(owner_name, {})
-                if field_name in fields:
-                    verified = True
-                    data_type = fields[field_name]
-
+            target = rs_target
+            if rs_target["group"] == "sql":
+                if not rs_target.get("table"):
+                    return
+                table = rs_target["table"]
+                target = {"node_id": self._object_id("table", table),
+                          "group": "table", "name": table}
+            known = self._fields_of(target["group"], target["name"])
+            hit = _lookup_field(known, field_name) if known is not None else None
+            if known is not None and not hit and "." in control_source:
+                # DAO names a column ambiguous across a join "Table.Field".
+                qualified = ".".join(_strip_brackets(p) for p in control_source.split("."))
+                hit = _lookup_field(known, qualified)
+            if known is not None and not hit:
+                if rs_target["group"] == "sql":
+                    return  # an alias or computed column of the inline SQL
+                owner = self.nodes.get(owner_id, {})
+                self.add_warning(
+                    "MissingField",
+                    f"{owner.get('group', '')} '{owner.get('label', owner_id)}' "
+                    f"control '{ctrl_name}' is bound to '{field_name}', which is "
+                    f"not a field of {target['group']} '{target['name']}'.",
+                    {"owner": owner.get("label", owner_id),
+                     "group": owner.get("group", ""), "ownerId": owner_id,
+                     "targetGroup": target["group"], "target": target["name"],
+                     "field": field_name, "via": f"ControlSource of {ctrl_name}"},
+                )
             fid = self._ensure_field_node(
-                target_node, owner_group, owner_name,
-                field_name, verified, data_type,
+                target["node_id"], target["group"], target["name"],
+                hit[0] if hit else field_name, bool(hit),
+                hit[1] if hit else None,
             )
             if fid:
                 self.add_edge(owner_id, fid, "ControlSource",
-                              "controlsource", "to",
-                              {"controlName": ctrl_name,
-                               "controlType": ctrl_type,
-                               "controlSource": control_source})
+                              "controlsource", "to", meta)
         elif rs_target:
             # Expression-based control (starts with = or has operators)
             self.add_edge(
                 owner_id, rs_target["node_id"], "ControlExpr",
-                "control-expression", "to",
-                {"controlName": ctrl_name, "controlType": ctrl_type,
-                 "controlSource": control_source},
+                "control-expression", "to", meta,
             )
 
     # ── Phase 4: VBA code heuristics ────────────────────────────────────
@@ -834,6 +1066,25 @@ class GraphBuilder:
             self.add_edge(owner_id, sql_id, "RunSQL", "vba-runsql", "to",
                           {"preview": _preview(sql_text, 80)})
 
+        # db.Execute / db.OpenRecordset with a saved query/table name or SQL
+        for m in _VBA_SQL_CALL_RE.finditer(code):
+            method = m.group(1)
+            arg = m.group(2).replace('""', '"').strip()
+            if not arg:
+                continue
+            if _is_likely_sql(arg):
+                sql_id = self._ensure_sql_node(
+                    arg, f"{owner_group}:{owner_name}:VBA", sql_dir)
+                self.add_edge(owner_id, sql_id, method, "vba-runsql", "to",
+                              {"preview": _preview(arg, 80)})
+                continue
+            for t in self._targets_for_name(arg, data_only=True):
+                self.add_edge(owner_id, t["node_id"], method, "vba-data-ref",
+                              "to", {"name": arg})
+
+        # Forms!frm!ctl, Forms("frm"), Reports!rpt
+        self._link_object_refs(owner_id, code, {"via": "VBA"}, vba=True)
+
         # SourceObject assignment in VBA
         for m in _VBA_SOURCEOBJECT_RE.finditer(code):
             so_value = m.group(1).replace('""', '"').strip()
@@ -872,26 +1123,24 @@ class GraphBuilder:
                             "vba-type-ref", "to", {"name": tgt_name},
                         )
 
-        # Cross-module procedure calls (bare FuncName( or Call SubName)
+        # Cross-module procedure calls: Foo(, Call Foo, or Foo a, b
         if self._proc_call_re:
-            seen_call: set[str] = set()
-            for m in self._proc_call_re.finditer(code):
-                matched = m.group(0)
-                # Extract the procedure name from the match
-                # Strip leading 'Call ' if present, trailing '(' or whitespace
-                proc_name = re.sub(
-                    r"^\s*Call\s+", "", matched, flags=re.I
-                ).rstrip("( \t")
+            # A same-named procedure in this module shadows the public one.
+            local = {
+                m.group(1).lower()
+                for rx in (_VBA_PROC_DECL_RE, _VBA_PRIVATE_PROC_RE)
+                for m in rx.finditer(code)
+            }
+            call_code = _blank_string_literals(_VBA_DECL_LINE_RE.sub("", code))
+            for m in self._proc_call_re.finditer(call_code):
+                proc_name = m.group("paren") or m.group("call") or m.group("stmt")
                 pname_lower = proc_name.lower()
-                target_ids = self._proc_index.get(pname_lower, [])
-                for tid in target_ids:
-                    if tid == owner_id:
-                        continue  # skip self-edges
-                    edge_key = f"{owner_id}->{tid}:call:{pname_lower}"
-                    if edge_key not in seen_call:
-                        seen_call.add(edge_key)
+                if pname_lower in local:
+                    continue
+                for tid in self._proc_index.get(pname_lower, []):
+                    if tid != owner_id:
                         self.add_edge(
-                            owner_id, tid, "calls",
+                            owner_id, tid, f"calls {proc_name}",
                             "vba-call", "to", {"procedure": proc_name},
                         )
 
@@ -937,6 +1186,42 @@ class GraphBuilder:
                             node_id, t["node_id"], dname,
                             "query-sql-reference", "to", {"name": dname},
                         )
+            self._add_field_ref_edges(node_id, sql, "query-field")
+            self._link_object_refs(node_id, sql, {"via": "SQL"})
+            self._read_query_fields(qd, name, node_id)
+
+        if self.field_mode == "all":
+            for qname, fields in self._known_query_fields.items():
+                for fname, dtype in fields.items():
+                    self._ensure_field_node(self._object_id("query", qname),
+                                            "query", qname, fname, True, dtype)
+
+    def _read_query_fields(self, qd: Any, name: str, node_id: str) -> None:
+        """Record a row-returning query's output fields and their DAO lineage."""
+        try:
+            qtype = int(qd.Type)
+        except Exception:
+            return
+        if qtype not in _DAO_ROW_QUERY_TYPES:
+            return
+        fields: list[tuple[str, str, str, str]] = []
+        try:
+            for fld in qd.Fields:
+                fields.append((
+                    fld.Name,
+                    _safe_attr(fld, "SourceTable"),
+                    _safe_attr(fld, "SourceField"),
+                    DAO_FIELD_TYPE.get(fld.Type, str(fld.Type)),
+                ))
+        except Exception as exc:
+            self.add_warning(
+                "QueryFieldsUnavailable",
+                f"Could not resolve the output fields of query '{name}' "
+                f"(often a missing table, query or field): {exc}",
+                {"owner": name, "group": "query", "ownerId": node_id},
+            )
+            return
+        self.set_query_fields(name, fields)
 
     def analyze_macro(
         self, db_path: str, macro_name: str, sql_dir: str | None
@@ -949,7 +1234,17 @@ class GraphBuilder:
         except Exception:
             return
         self._set_raw_meta(macro_id, text, "macro", macro_name)
-        lines = text.splitlines()
+        self._analyze_macro_lines(macro_id, text.splitlines(), sql_dir)
+
+    def _analyze_macro_lines(
+        self, owner_id: str, lines: list[str], sql_dir: str | None,
+        extra_meta: dict | None = None,
+    ) -> None:
+        """Edges for Action/Argument pairs — standalone or embedded macros."""
+        extra = dict(extra_meta or {})
+        embedded = extra.get("embedded")
+        via = f"embedded macro {embedded}" if embedded else "macro"
+        origin = f"{owner_id}:{embedded}" if embedded else owner_id
         i = 0
         while i < len(lines):
             m_act = _MACRO_ACTION_RE.match(lines[i])
@@ -965,25 +1260,25 @@ class GraphBuilder:
                 if m_arg:
                     arg_value = _convert_access_literal(m_arg.group(1))
                     break
+            i += 1
+            if not arg_value:
+                continue
 
-            if action in _MACRO_ACTIONS and arg_value:
+            if action in _MACRO_ACTIONS:
                 grp, lbl, knd = _MACRO_ACTIONS[action]
                 target_id = self._resolve_named(grp, arg_value)
-                if target_id:
-                    self.add_edge(macro_id, target_id, lbl, knd, "to",
-                                  {"name": arg_value})
-                else:
-                    self._warn_missing(macro_id, grp, arg_value,
-                                       f"macro {lbl}")
-
-            if action == "RunSQL" and arg_value:
-                sql_id = self._ensure_sql_node(
-                    arg_value, f"macro:{macro_name}", sql_dir
-                )
-                self.add_edge(macro_id, sql_id, "RunSQL", "macro-runsql",
-                              "to", {"preview": _preview(arg_value, 80)})
-
-            i += 1
+                if not target_id:
+                    self._warn_missing(owner_id, grp, arg_value, f"{via} {lbl}")
+                elif target_id != owner_id:
+                    self.add_edge(owner_id, target_id, lbl, knd, "to",
+                                  {**extra, "name": arg_value})
+            elif action == "RunCode":
+                self._link_function_calls(owner_id, arg_value, "RunCode",
+                                          "macro-runcode", extra)
+            elif action == "RunSQL":
+                sql_id = self._ensure_sql_node(arg_value, origin, sql_dir)
+                self.add_edge(owner_id, sql_id, "RunSQL", "macro-runsql", "to",
+                              {**extra, "preview": _preview(arg_value, 80)})
 
     def analyze_module_code(
         self, db_path: str, module_name: str, sql_dir: str | None
@@ -1043,8 +1338,7 @@ class GraphBuilder:
             "meta": {
                 "database": db_path,
                 "generatedAt": datetime.now(timezone.utc).isoformat(),
-                # Server-side file time, so the staleness check survives clock skew.
-                "databaseMtime": _file_mtime(db_path),
+                "designStamps": self.design_stamps,
                 "fieldNodeMode": {
                     "none": "None",
                     "referenced": "ReferencedOnly",
@@ -1128,11 +1422,35 @@ def _is_system(name: str) -> bool:
     return name.startswith("MSys") or name.startswith("~")
 
 
-def _file_mtime(path: str) -> float | None:
+def design_stamps(app: Any, db: Any) -> dict[str, str]:
+    """node id -> last design change (DAO LastUpdated / AccessObject.DateModified).
+
+    Unlike the file's mtime, these move only on design edits — not on data
+    writes, and not on the rewrite Access does when it closes the database.
+    """
+    stamps: dict[str, str] = {}
+    for coll, group in ((db.TableDefs, "table"), (db.QueryDefs, "query")):
+        for obj in coll:
+            if not _is_system(obj.Name):
+                stamps[f"{group}:{obj.Name}"] = _safe_attr(obj, "LastUpdated")
+    for attr, group in (("AllForms", "form"), ("AllReports", "report"),
+                        ("AllMacros", "macro"), ("AllModules", "module")):
+        try:
+            for item in getattr(app.CurrentProject, attr):
+                if not _is_system(item.Name):
+                    stamps[f"{group}:{item.Name}"] = _safe_attr(item, "DateModified")
+        except Exception:
+            pass
+    return stamps
+
+
+def _safe_attr(obj: Any, name: str) -> str:
+    """A COM property as text, or "" when it raises (e.g. calculated fields)."""
     try:
-        return os.path.getmtime(path)
-    except OSError:
-        return None
+        value = getattr(obj, name)
+    except Exception:
+        return ""
+    return str(value) if value is not None else ""
 
 
 _REM_RE = re.compile(r"^\s*Rem(\s|$)", re.I)
@@ -1155,6 +1473,111 @@ def _strip_vba_comments(code: str) -> str:
                 break
         out.append(line[:cut])
     return "\n".join(out)
+
+
+def _blank_string_literals(code: str) -> str:
+    """Replace the contents of VBA string literals with spaces (quotes kept)."""
+    return _VBA_STRING_LITERAL_RE.sub(
+        lambda m: '"' + " " * len(m.group(1)) + '"', code
+    )
+
+
+def _lookup_field(fields: dict[str, str], name: str) -> tuple[str, str] | None:
+    """(canonical name, data type) of a field, matched case-insensitively."""
+    if name in fields:
+        return name, fields[name]
+    low = name.lower()
+    for k, v in fields.items():
+        if k.lower() == low:
+            return k, v
+    return None
+
+
+def _qualified_field_refs(
+    sql: str, table_fields: dict[str, dict[str, str]]
+) -> list[tuple[str, str]]:
+    """(table, field) for every Table.Field / alias.Field naming a real table field."""
+    text = _SQL_STRING_RE.sub("''", sql)
+    by_lower = {t.lower(): t for t in table_fields}
+    aliases: dict[str, str] = {}
+    for m in _SQL_ALIAS_RE.finditer(text):
+        table = by_lower.get((m.group(1) or m.group(2)).lower())
+        alias = m.group(3) or m.group(4)
+        if table and alias.upper() not in _SQL_KEYWORDS:
+            aliases[alias.lower()] = table
+    out: list[tuple[str, str]] = []
+    for m in _SQL_QUAL_REF_RE.finditer(text):
+        qual = (m.group(1) or m.group(2)).lower()
+        table = aliases.get(qual) or by_lower.get(qual)
+        if not table:
+            continue
+        hit = _lookup_field(table_fields[table], m.group(3) or m.group(4))
+        if hit and (table, hit[0]) not in out:
+            out.append((table, hit[0]))
+    return out
+
+
+def _block_end(lines: list[str], start: int) -> int:
+    """Index of the End closing the block opened on ``lines[start]``."""
+    depth = 0
+    for j in range(start, len(lines)):
+        s = lines[j].strip()
+        if _BLOCK_OPEN_RE.match(s):
+            depth += 1
+        elif s == "End":
+            depth -= 1
+            if depth == 0:
+                return j
+    return len(lines) - 1
+
+
+def _embedded_macro_blocks(text: str) -> list[dict]:
+    """``[{control, property, lines}]`` for each ``OnXxxEmMacro = Begin`` block.
+
+    The owning block's ``Name`` may come after the macro, so it is assigned
+    when that block closes. Form-level macros get ``control: ""``.
+    """
+    lines = text.splitlines()
+    out: list[dict] = []
+    stack: list[dict] = []
+
+    def _flush(frame: dict) -> None:
+        for entry in frame["pending"]:
+            entry["control"] = frame["name"]
+            out.append(entry)
+
+    i = 0
+    while i < len(lines):
+        s = lines[i].strip()
+        if s in ("CodeBehindForm", "CodeBehindReport"):
+            break
+        m = _EM_MACRO_RE.match(s)
+        if m:
+            end = _block_end(lines, i)
+            entry = {"control": "", "property": m.group(1),
+                     "lines": lines[i + 1:end]}
+            (stack[-1]["pending"] if stack else out).append(entry)
+            i = end + 1
+            continue
+        if _BLOCK_OPEN_RE.match(s):
+            if s.startswith("Begin"):
+                stack.append({"name": "", "pending": []})
+                i += 1
+            else:
+                i = _block_end(lines, i) + 1  # other Prop = Begin blocks
+            continue
+        if s == "End":
+            if stack:
+                _flush(stack.pop())
+            i += 1
+            continue
+        m = _NAME_PROP_RE.match(s)
+        if m and stack and not stack[-1]["name"]:
+            stack[-1]["name"] = m.group(1)
+        i += 1
+    while stack:
+        _flush(stack.pop())
+    return out
 
 
 def _strip_brackets(name: str) -> str:
@@ -1391,6 +1814,13 @@ def ac_graph(
     # including those skipped above when heuristics were disabled.
     if raw_export_mode == "debug":
         gb.export_raw_remaining(db_path, obj_list)
+
+    # Snapshot last: the stamps must describe the design the graph was built from.
+    try:
+        gb.design_stamps = design_stamps(app, app.CurrentDb())
+    except Exception as exc:
+        gb.add_warning("DesignStampsFailed",
+                       f"Could not record design timestamps: {exc}")
 
     # Phase 6: output
     return gb.build_output(abs_db, out_dir, field_mode, embed_viewer)
