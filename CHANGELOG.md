@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.7.71
+
+Merges upstream unmateria **v0.7.64** into this graph-enabled fork. No new
+tools (still **71**: upstream's 69 + `access_graph` + `access_graph_query`).
+The dependency graph is untouched.
+
+### Fixed
+
+- **`access_get_code` → `access_set_code` round trip works for forms and
+  reports** (upstream v0.7.64, reported by Tom van Stiphout). Binary blocks
+  (`RecSrcDt`, `GUID`, `NameMap`, `PrtMip`, `PrtDevMode`…) were restored after
+  the sections block, where Access accepts only `End`, so every import failed.
+  They are now collected per owner (form/report, each section and control) and
+  restored right after the property they followed. Section and control GUIDs,
+  previously dropped, survive the round trip.
+
+### Added
+
+- **`section` on `access_set_form_property` / `access_get_form_property`**
+  (upstream v0.7.64): read or set a section's properties (number 0–8 or a name
+  such as `Detail`, `FormHeader`, `PageHeader`), invoked through the raw
+  IDispatch because pywin32 can't call `Form.Section(n)`.
+- `tests/test_binary_sections.py` (upstream, 10 pure tests).
+
+### Docs
+
+- README: manual install now pins `mcp<2` and includes Pillow; Python 3.10+
+  to match `requires-python` (upstream).
+- Upstream note worth knowing: Access keeps a form's `NameMap` (Name
+  AutoCorrect) only when the imported text has a valid `Checksum`, so any
+  edited import drops it.
+
 ## 0.7.70
 
 **Values that exist only at runtime, narrowed statically.** Fork-only; no new
