@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.7.72
+
+Merges upstream unmateria **v0.7.65** (Access session lifecycle, PR #42 by
+Juanjo Luna) into this graph-enabled fork. No new tools (still **71**). The
+dependency graph is untouched; it only uses `_Session.connect` and
+`_Session._app`, which did not change.
+
+### Changed
+
+- **The MCP no longer closes your own database or quits your own Access**
+  (upstream v0.7.65). A user-owned database found open in an attached Access
+  stays open when the session switches targets, creates a database, compiles
+  or compacts; `access_close` disconnects from an attached instance instead
+  of quitting it and now returns an accurate message.
+- MCP-owned Access is shut down more reliably: child proxies are released,
+  STA messages are pumped while the dialog watchdog runs, and only an
+  MCP-owned process still alive after 10 s is force-terminated. A script that
+  exits without `access_close` no longer leaves Access holding the file lock.
+- Upstream tests: `tests/test_session_lifecycle.py` (mocked, no COM).
+
 ## 0.7.71
 
 Merges upstream unmateria **v0.7.64** into this graph-enabled fork. No new

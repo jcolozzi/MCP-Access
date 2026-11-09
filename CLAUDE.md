@@ -22,8 +22,8 @@ MCP server for reading and editing Microsoft Access databases (`.accdb`/`.mdb`) 
 
 ## Architecture
 
-- **Singleton COM session** (`_Session`): one `Access.Application` instance shared across all tool calls. Opening a different `.accdb` closes the previous one.
-- **Dedicated COM thread** (`_com_executor`): All tool calls run in a single-threaded `ThreadPoolExecutor` with `CoInitialize()`. This keeps COM in one STA thread while the asyncio event loop stays free to read/write stdio.
+- **Singleton COM session** (`_Session`): one `Access.Application` instance shared across all tool calls. Switching databases closes the previous one in MCP-owned instances or when the MCP opened it in an attached instance; a database opened by the user is preserved and another instance is acquired for the target.
+- **Dedicated COM thread** (`_com_executor`): All tool calls run in a single-threaded `ThreadPoolExecutor` with `CoInitialize()`. Server shutdown releases COM proxies and calls `CoUninitialize()` on that same worker, never from `atexit`.
 - **Caches**: `_parsed_controls_cache` (control parsing) and `_Session._cm_cache` (CodeModule COM objects — live COM proxies). Both invalidated on DB switch, object modification, and design operations. There is **no** Python-side cache of VBE text: `_cm_all_code()` always reads via `cm.Lines(1, total)` so external edits (manual VBE edits, Ctrl+Z, add-ins) are picked up immediately. See issue #26 for the reason this cache was removed.
 - **Binary section handling**: `ac_get_code` strips PrtMip/PrtDevMode/RecSrcDt/GUID/NameMap from form/report exports; `ac_set_code` restores them automatically before import — per owner and anchored, see "Binary block restore" below.
 
@@ -57,6 +57,47 @@ MCP server for reading and editing Microsoft Access databases (`.accdb`/`.mdb`) 
 | **Knowledge base** | `access_tips` |
 
 ## Key Implementation Details
+
+### Session disconnect and shutdown
+
+`access_close` reports whether it disconnected from user-owned Access (database
+left open) or quit an MCP-created instance. An idle user-owned instance may open
+the requested database and retains it after disconnect. Database switching and
+creation inspect live attached state, not just `_db_open`, before closing anything.
+If the MCP opened the database inside an initially idle attached instance, later
+target switches reuse that instance; a different database opened by the user is
+left untouched.
+
+Ownership lives in two markers, both reset on `_launch` and `_force_cleanup`:
+`_opened_in_attached` (the database this session opened there) and
+`_user_db_in_attached` (the database `_prepare_database_target` saw open
+without our marker). The second one exists for compile/compact/decompile: they
+close the user's database and reopen it through `connect()`, and without it
+that `OpenCurrentDatabase` made the database ours, so the next switch closed
+the user's window. Leaning conservative is deliberate: a user database we
+reopen is never claimed, even if the user closed it in between.
+
+Known limitation (A→B→A): after leaving the user's A for our own instance on
+B, a request for A opens it shared in our instance (v0.7.56 lock warning).
+`GetActiveObject` returns one ROT entry, so re-attaching to the user's window
+is not reliable.
+
+Owned shutdown clears child COM proxies before `Quit`, releases the application
+proxy, then waits up to 10 seconds for the recorded PID, pumping STA
+messages with the dialog watchdog still active. If the owned process is still
+running after 10 seconds, it is terminated with `taskkill` and that is reported;
+attached user-owned processes are never force-killed. An unavailable PID is
+explicitly reported as an unverified exit. Explicit compile/decompile and
+maintenance operations retain their existing behavior; these disconnect
+protections do not make those operations non-destructive.
+
+`atexit` holds one COM-free safety net, `_kill_orphaned_owned_instance`: if an
+MCP-owned instance is still recorded at process exit it is `taskkill`ed by PID.
+The server never reaches it (main()'s `finally` quits on the worker first, which
+leaves `_app` None). It exists for library use: a script driving
+`call_tool_sync` that dies without `access_close` left an orphan holding the
+file lock (measured, 2026-10-31). Attached instances are never touched. Do NOT
+put COM calls in it: atexit runs on whatever thread is exiting.
 
 ### Encoding in ac_set_code
 - **Modules** (`.bas`): written using the system ANSI codepage (`locale.getpreferredencoding()`, typically `cp1252` on Western Windows) — no BOM.
@@ -1071,9 +1112,9 @@ cap at MAX_PATH, reflect the value inside backticks).
 
 ## Critical DO NOTs
 
-- **Do NOT remove the `DispatchEx` fallback** in `_Session._launch()`. `_launch(target_path)` tries `GetActiveObject("Access.Application")` first, but the attach is **conditional** (v0.7.58, issue #38): it keeps the candidate only when that instance is idle (`CurrentDb()` is None) or already holds `target_path` (`os.path.normcase` comparison, like `_already_open`). An instance with a **different** database open is dropped — attaching to it means `ac_create_database`'s `CloseCurrentDatabase()` shuts down the user's own work, which is how @Access-Abraxas' VBA killed the very code calling this server. `target_path=None` keeps the historical attach-anything behaviour for callers with no destination. Known limitation: `GetActiveObject` returns one ROT entry, so with several Access windows open we may spawn a process even though another window had the target open. Do NOT "fix" this by marking who opened the database and leaving a foreign one alone in `_switch` — we would then reopen it shared later, with the v0.7.56 lock warning and design-lock conflicts. Everything else is unchanged: the fallback is `DispatchEx`, required after `/decompile` kills to bypass stale ROT entries. Do NOT swap `DispatchEx` for `Dispatch` in the fallback — `Dispatch` latches onto the stale ROT entry. Under `MCP_ACCESS_EXCLUSIVE` the attach is skipped entirely (a running instance holds the file shared) and `DispatchEx` is the only path — do NOT "restore" attaching there.
-- **Do NOT call `cls._app.Quit()` unconditionally in `_decompile()` / `ac_decompile_compact()`**. Check `_Session._attached` first — when True we attached to the user's Access and must only `CloseCurrentDatabase()`, keeping the instance alive. Only when `_attached=False` (we spawned via `DispatchEx`) is `Quit(1)` safe. Same applies to the `atexit` handler `_Session.quit()`.
-- **Do NOT use `EnsureDispatch`** — it changes binding for all 70 tools and adds `gen_py` cache dependency.
+- **Do NOT remove the `DispatchEx` fallback** in `_Session._launch()`. `_launch(target_path)` tries `GetActiveObject("Access.Application")` first, but the attach is **conditional** (v0.7.58, issue #38): it keeps the candidate only when that instance is idle (`CurrentDb()` is None) or already holds `target_path` (`os.path.normcase` comparison, like `_already_open`). An instance with a **different** database open is dropped — attaching to it means `ac_create_database`'s `CloseCurrentDatabase()` shuts down the user's own work, which is how @Access-Abraxas' VBA killed the very code calling this server. `target_path=None` keeps the historical attach-anything behaviour for callers with no destination. Known limitation: `GetActiveObject` returns one ROT entry, so with several Access windows open we may spawn a process even though another window had the target open. Since PR #42 `_switch` does track who opened the database (`_opened_in_attached`) and leaves a user's database alone, launching our own instance for the other target — see "Session disconnect and shutdown". The cost predicted here is real and accepted: going back to the user's database later opens it shared in our instance (v0.7.56 lock warning). Everything else is unchanged: the fallback is `DispatchEx`, required after `/decompile` kills to bypass stale ROT entries. Do NOT swap `DispatchEx` for `Dispatch` in the fallback — `Dispatch` latches onto the stale ROT entry. Under `MCP_ACCESS_EXCLUSIVE` the attach is skipped entirely (a running instance holds the file shared) and `DispatchEx` is the only path — do NOT "restore" attaching there.
+- **Do NOT call `cls._app.Quit()` unconditionally in `_decompile()` / `ac_decompile_compact()`**. Check `_Session._attached` first — when True we attached to the user's Access and must only `CloseCurrentDatabase()`, keeping the instance alive. Only when `_attached=False` (we spawned via `DispatchEx`) is `Quit(1)` safe.
+- **Do NOT use `EnsureDispatch`** — it changes binding for all 71 tools and adds `gen_py` cache dependency.
 - **Do NOT run `OpenCurrentDatabase` in a separate thread** — COM STA objects can only be used from the thread that created them.
 - **Do NOT call `CreateForm()` directly** — use `access_create_form` tool to avoid the "Save As" MsgBox.
 - **Do NOT change schemas to strict `"type": "integer"`** — MCP clients can't be trusted to send correct types.
